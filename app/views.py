@@ -1335,13 +1335,7 @@ def search(request: HttpRequest):
     pos_list = Position.objects.activated().filter(person__name__icontains=query).filter(
         Q(show_post=True) | Q(is_admin=True))
     # 通过小组名、小组类名、和上述的职务信息对应的小组信息
-    # 只查找公开的小组
-    only_active = request.GET.get("only_active")
-    if only_active:
-        organization_qs = Organization.objects.activated()
-    else:
-        organization_qs = Organization.objects.all()
-    organization_list = organization_qs.filter(
+    organization_list = Organization.objects.filter(
         Q(oname__icontains=query)
         | Q(otype__otype_name__icontains=query)
         | Q(id__in=pos_list.values("org"))

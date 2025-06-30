@@ -133,13 +133,6 @@
                                             <div style="display:flex;
                                             justify-content: center;
                                             align-items: center;">
-                                                <form method="get" id="org-search-form" style="margin-bottom:0;display:inline-block;">
-                                                    <input type="hidden" name="Query" value="{{ request.GET.Query }}">
-                                                    <label style="margin-bottom:0;">
-                                                        <input type="checkbox" name="only_active" value="1" {% if request.GET.only_active %}checked{% endif %} onchange="document.getElementById('org-search-form').submit();">
-                                                        只显示激活小组
-                                                    </label>
-                                                </form>
                                                 <i class="fa" aria-hidden="true"></i>
                                             </div>
                                         </div>
