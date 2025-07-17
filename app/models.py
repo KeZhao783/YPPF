@@ -381,8 +381,7 @@ class NaturalPerson(models.Model):
 
     def get_absolute_url(self, absolute=False):
         '''User一对一模型的建议方法'''
-        url = f'/stuinfo/?name={self.name}'
-        url += f'+{self.person_id_id}'
+        url = f'/stuinfo/?name={self.name}&id={self.person_id_id}'
         return url
 
     def get_user_ava(self: Self | None = None):
@@ -693,6 +692,12 @@ class Position(models.Model):
     class Meta:
         verbose_name = "1.职务"
         verbose_name_plural = verbose_name
+        constraints = [
+            models.UniqueConstraint(
+                fields=['person', 'org', 'semester', 'year'],
+                name='Unique position per person, org, semester, year'
+            )
+        ]
 
     person = models.ForeignKey(
         NaturalPerson, related_name="position_set", on_delete=models.CASCADE,
