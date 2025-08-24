@@ -41,6 +41,7 @@ from Appointment.appoint.manage import (
 )
 from Appointment import jobs
 from Appointment.config import appointment_config as CONFIG
+from Appointment.utils.AI_Inspection import AI_Inspection
 
 
 # 一些固定值
@@ -915,6 +916,10 @@ def checkout_appoint(request: UserRequest):
         # 检查是否未填写房间用途
         if not contents['Ausage']:
             wrong("请输入房间用途!", render_context)
+        # 自动化审核房间用途是否合规
+        is_valid, reason = AI_Inspection(room.Rid, contents['Ausage'])
+        if not is_valid:
+            wrong(f"房间用途不合规: {reason}", render_context)
         # 处理单人预约
         if "students" not in contents.keys():
             contents['students'] = [contents['Sid']]

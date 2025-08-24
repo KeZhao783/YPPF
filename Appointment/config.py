@@ -50,8 +50,8 @@ class AppointmentConfig(Config):
     allow_overlap = False
 
     # AI 审核功能开启与否，使用的 API 地址和密钥
-    AI_Inspection_Enabled = LazySetting('AI_Inspection/enabled')
-    AI_Inspection_API = LazySetting('AI_Inspection/API')
-    AI_Inspection_API_Key = LazySetting('AI_Inspection/API_Key')
+    AI_Inspection_Enabled = LazySetting('AI_Inspection/enabled', type=bool)
+    AI_Inspection_API = LazySetting('AI_Inspection/API', type=str)
+    AI_Inspection_API_Key = LazySetting('AI_Inspection/API_Key', type=str)
 
 appointment_config = AppointmentConfig(ROOT_CONFIG, 'underground')
