@@ -49,4 +49,9 @@ class AppointmentConfig(Config):
     # 是否允许单人同一时段预约两个房间
     allow_overlap = False
 
+    # AI 审核功能开启与否，使用的 API 地址和密钥
+    AI_Inspection_Enabled = LazySetting('AI_Inspection/enabled')
+    AI_Inspection_API = LazySetting('AI_Inspection/API')
+    AI_Inspection_API_Key = LazySetting('AI_Inspection/API_Key')
+
 appointment_config = AppointmentConfig(ROOT_CONFIG, 'underground')

@@ -56,6 +56,11 @@
         },
         "semester_data": {
             "semester_start": "2023-02-20"
+        },
+        "AI_Inspection": {
+            "enabled": false,
+            "API": "default_link",
+            "API_Key": "default_key"
         }
     },
     "course": {
