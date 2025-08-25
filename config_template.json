@@ -59,8 +59,9 @@
         },
         "AI_Inspection": {
             "enabled": false,
-            "API": "default_link",
-            "API_Key": "default_key"
+            "method": "Ollama",
+            "Ollama_ADDR": "",
+            "GLM_API_Key": ""
         }
     },
     "course": {
