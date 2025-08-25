@@ -4,9 +4,6 @@ import os
 import json
 import requests
 
-ENDPOINT = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
-MODEL = "glm-4.5-flash"
-
 # 模型人设：只返回“合规/不合规”，JSON格式
 SYSTEM_PROMPT = (
     "你是一个地下室内容审核员。"
@@ -20,11 +17,15 @@ def _call_glm_decision(text: str, timeout: int = 30) -> tuple[str, str]:
     """
     调用智谱 HTTP 接口，返回 '合规' 或 '不合规'，超时/网络错误报出异常。
     """
-    ENDPOINT = os.getenv("ENDPOINT", ENDPOINT)
-    MODEL = os.getenv("MODEL", MODEL)
-    api_key = os.getenv("ZHIPUAI_API_KEY")
+    ENDPOINT = os.getenv("ENDPOINT")
+    if not ENDPOINT:
+        raise RuntimeError("缺少环境变量 ENDPOINT")
+    MODEL = os.getenv("MODEL")
+    if not MODEL:
+        raise RuntimeError("缺少环境变量 MODEL")
+    api_key = os.getenv("API_KEY")
     if not api_key:
-        raise RuntimeError("缺少环境变量 ZHIPUAI_API_KEY")
+        raise RuntimeError("缺少环境变量 API_KEY")
 
     headers = {
         "Authorization": f"Bearer {api_key}",
