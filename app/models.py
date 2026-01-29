@@ -327,8 +327,12 @@ class NaturalPerson(models.Model):
     stu_dorm = models.CharField("宿舍", max_length=6, null=True, blank=True)
 
     class GraduateStatus(models.IntegerChoices):
-        UNDERGRADUATED = (0, "未毕业")
-        GRADUATED = (1, "已毕业")
+        UNDERGRADUATED = (0, "在读/在职")
+        GRADUATED = (1, "已毕业/退休")
+        INSTRUCTOR = (2, "住宿辅导员")
+        POSTPONED = (3, "延毕")
+        ONLEAVE = (4, "休学")
+        
 
     status = models.SmallIntegerField(
         "在校状态", choices=GraduateStatus.choices, default=0)
@@ -394,7 +398,7 @@ class NaturalPerson(models.Model):
     def is_teacher(self, activate=True):
         result = self.identity == NaturalPerson.Identity.TEACHER
         if activate:
-            result &= self.status != NaturalPerson.GraduateStatus.GRADUATED
+            result &= self.status != NaturalPerson.GraduateStatus.GRADUATED # 已退休教师不视为教师
         return result
 
     def get_accept_promote_display(self):
