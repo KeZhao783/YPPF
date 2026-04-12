@@ -1,13 +1,12 @@
 import os
 import io
-import urllib.parse
 from datetime import datetime, timedelta
 from typing import Literal
 
 from django.db import transaction
 from django.db.models import F
 import csv
-import qrcode
+import json
 
 from generic.models import User
 from generic.utils import to_search_indices
@@ -31,7 +30,9 @@ from app.activity_utils import (
     apply_activity,
     cancel_activity,
     withdraw_activity,
-    get_activity_QRcode,
+    can_access_checkin_qrcode,
+    fetch_miniprogram_checkin_qrcode,
+    generate_legacy_checkin_qrcode,
     create_participate_infos,
     modify_participants,
     weekly_summary_orgs,
@@ -48,6 +49,7 @@ __all__ = [
     'addActivity', 'activityCenter', 'examineActivity',
     'offlineCheckinActivity', 'finishedActivityCenter', 'activitySummary',
     'WeeklyActivitySummary',
+    'debugActivityQrcode',
 ]
 
 
@@ -253,20 +255,13 @@ def viewActivity(request: HttpRequest, aid=None):
 
     # 签到
     need_checkin = activity.need_checkin
-    show_QRcode = activity.need_checkin and activity.status in [
-        Activity.Status.APPLYING,
-        Activity.Status.WAITING,
-        Activity.Status.PROGRESSING
-    ]
+    show_QRcode = can_access_checkin_qrcode(activity)
 
     if activity.inner and request.user.is_person():
         position = Position.objects.activated().filter(
             person=me, org=activity.organization_id)
         if len(position) == 0:
             not_inner = True
-
-    if ownership and need_checkin:
-        aQRcode = get_activity_QRcode(activity)
 
     # 活动宣传图片 ( 一定存在 )
     photo: ActivityPhoto = activity.photos.get(
@@ -320,7 +315,7 @@ def getActivityInfo(request: HttpRequest):
     '''
     通过GET获得活动信息表下载链接
     GET参数?activityid=id&infotype=sign[&output=id,name,gender,telephone][&format=csv|excel]
-    GET参数?activityid=id&infotype=qrcode
+    GET参数?activityid=id&infotype=qrcode[&version=new|old]
     activity_id : 活动id
     infotype    : sign or qrcode or 其他（以后可以拓展）
         sign报名信息:
@@ -329,10 +324,13 @@ def getActivityInfo(request: HttpRequest):
         format  : [可选]csv or excel
                     [默认]csv
         qrcode签到二维码
+        version : [可选]new or old
+                    [默认]new
     example: http://127.0.0.1:8000/getActivityInfo?activityid=1&infotype=sign
     example: http://127.0.0.1:8000/getActivityInfo?activityid=1&infotype=sign&output=id,wtf
     example: http://127.0.0.1:8000/getActivityInfo?activityid=1&infotype=sign&format=excel
     example: http://127.0.0.1:8000/getActivityInfo?activityid=1&infotype=qrcode
+    example: http://127.0.0.1:8000/getActivityInfo?activityid=1&infotype=qrcode&version=old
     TODO: 前端页面待对接
     '''
 
@@ -386,19 +384,17 @@ def getActivityInfo(request: HttpRequest):
             return response  # downloadable
 
     elif info_type == "qrcode":
-        # checkin begins 1 hour ahead
-        assert datetime.now() > activity.start - timedelta(hours=1), "签到未开始"
-        checkin_url = f"/checkinActivity?activityid={activity.id}"
-        origin_url = request.scheme + "://" + request.META["HTTP_HOST"]
-        checkin_url = urllib.parse.urljoin(
-            origin_url, checkin_url)  # require full path
+        assert can_access_checkin_qrcode(activity), "签到二维码暂不可用"
 
-        buffer = io.BytesIO()
-        qr = qrcode.QRCode(version=1, box_size=10, border=5)
-        qr.add_data(checkin_url), qr.make(fit=True)
-        img = qr.make_image(fill_color="black", back_color="white")
-        img.save(buffer, "jpeg"), buffer.seek(0)
-        return HttpResponse(buffer, content_type="img/jpeg")
+        version = request.GET.get("version", "new")
+        assert version in ["new", "old"], "不支持的二维码版本"
+
+        if version == "new":
+            content, content_type = fetch_miniprogram_checkin_qrcode(activity)
+        else:
+            content, content_type = generate_legacy_checkin_qrcode(
+                request, activity)
+        return HttpResponse(content, content_type=content_type)
 
 
 @login_required(redirect_field_name="origin")
