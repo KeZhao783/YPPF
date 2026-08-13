@@ -128,10 +128,22 @@ class AnswerTextViewSet(viewsets.ModelViewSet):
 
 
 class AnswerSheetViewSet(viewsets.ModelViewSet):
-    queryset = AnswerSheet.objects.all()
     authentication_classes = [SessionAuthentication]
     permission_classes = [IsAuthenticated, IsSheetOwnerOrAsker]
     serializer_class = AnswerSheetSerializer
+    http_method_names = ['get', 'post', 'delete', 'head', 'options']
+
+    def get_queryset(self):
+        sheets = AnswerSheet.objects.select_related('survey')
+        if self.action == 'retrieve':
+            return sheets.filter(
+                Q(creator=self.request.user)
+                | Q(
+                    survey__creator=self.request.user,
+                    status=AnswerSheet.Status.SUBMITTED,
+                )
+            )
+        return sheets.filter(creator=self.request.user)
 
     # debug时可以注释掉
     def list(self, request, *args, **kwargs):
@@ -147,16 +159,6 @@ class AnswerSheetViewSet(viewsets.ModelViewSet):
         else:
             serializer.save()
 
-    def perform_update(self, serializer: AnswerSheetSerializer):
-        sheet_status = serializer.instance.status
-        if sheet_status == AnswerSheet.Status.DRAFT:
-            survey = serializer.instance.survey
-            if survey != serializer.validated_data['survey']:
-                raise PermissionError("禁止修改答卷所属问卷！")
-            serializer.save()  # 此部分中只能修改提交状态
-        else:
-            raise PermissionError("禁止修改答卷！")
-
     @action(detail=False, methods=['GET'])
     def answer_owner(self, request):
         sheet = AnswerSheet.objects.filter(creator=request.user)
@@ -165,6 +167,9 @@ class AnswerSheetViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['GET'])
     def survey_owner(self, request):
-        sheet = AnswerSheet.objects.filter(survey__creator=request.user)
+        sheet = AnswerSheet.objects.filter(
+            survey__creator=request.user,
+            status=AnswerSheet.Status.SUBMITTED,
+        )
         serializer = AnswerSheetSerializer(sheet, many=True)
         return Response(serializer.data)

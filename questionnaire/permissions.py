@@ -1,5 +1,7 @@
 from rest_framework import permissions
 
+from questionnaire.models import AnswerSheet
+
 __all__ = [
     'IsTextOwnerOrAsker',
     'IsSheetOwnerOrAsker',
@@ -22,9 +24,13 @@ class IsTextOwnerOrAsker(permissions.BasePermission):
 
 class IsSheetOwnerOrAsker(permissions.BasePermission):
     def has_object_permission(self, request, view, obj):
-        owner = obj.creator
-        asker = obj.survey.creator
-        return check_owner_or_asker(request, owner, asker)
+        if request.user == obj.creator:
+            return True
+        return (
+            request.method in permissions.SAFE_METHODS
+            and obj.status == AnswerSheet.Status.SUBMITTED
+            and request.user == obj.survey.creator
+        )
 
 
 def check_owner_or_read_only(request, owner):

@@ -43,7 +43,8 @@ class AnswerSheetSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = AnswerSheet
-        fields = '__all__'
+        fields = ['id', 'survey', 'creator', 'create_time', 'status']
+        read_only_fields = ['id', 'create_time', 'status']
 
 
 class AnswerTextSerializer(serializers.ModelSerializer):
