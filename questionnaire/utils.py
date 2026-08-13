@@ -1,0 +1,65 @@
+from datetime import datetime
+
+from django.core.exceptions import ValidationError as DjangoValidationError
+from django.db import transaction
+from rest_framework import serializers
+from rest_framework.exceptions import PermissionDenied
+
+from questionnaire.models import AnswerSheet, AnswerText, Survey
+from questionnaire.validators import validate_answer_body
+
+
+def submit_answersheet(sheet_id, actor, now=None):
+    now = datetime.now() if now is None else now
+    with transaction.atomic():
+        sheet = (
+            AnswerSheet.objects
+            .select_for_update()
+            .select_related('survey')
+            .get(pk=sheet_id)
+        )
+        if sheet.creator_id != actor.pk:
+            raise PermissionDenied("只有答卷创建者才能提交答卷！")
+        if sheet.status != AnswerSheet.Status.DRAFT:
+            raise serializers.ValidationError("答卷已经提交！")
+
+        survey = sheet.survey
+        if survey.status != Survey.Status.PUBLISHED:
+            raise serializers.ValidationError("只能提交已发布的问卷！")
+        if not survey.start_time <= now <= survey.end_time:
+            raise serializers.ValidationError("当前不在问卷提交时间内！")
+
+        questions = list(
+            survey.questions.prefetch_related('choices').order_by('order'))
+        question_by_id = {
+            question.pk: question
+            for question in questions
+        }
+        answer_by_question = {}
+        for answer in AnswerText.objects.filter(answersheet=sheet):
+            question = question_by_id.get(answer.question_id)
+            if question is None:
+                raise serializers.ValidationError(
+                    "答案与答卷不属于同一问卷！")
+            if question.pk in answer_by_question:
+                raise serializers.ValidationError(
+                    "同一问题存在重复答案！")
+
+            body = (answer.body or '').strip()
+            if not body:
+                raise serializers.ValidationError("答案不能为空！")
+            try:
+                validate_answer_body(question, body)
+            except DjangoValidationError as exc:
+                raise serializers.ValidationError(exc.messages) from exc
+            answer_by_question[question.pk] = answer
+
+        if any(
+            question.required and question.pk not in answer_by_question
+            for question in questions
+        ):
+            raise serializers.ValidationError("必填题尚未完成！")
+
+        sheet.status = AnswerSheet.Status.SUBMITTED
+        sheet.save(update_fields=['status'])
+        return sheet

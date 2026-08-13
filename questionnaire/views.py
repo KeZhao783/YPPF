@@ -8,6 +8,7 @@ from rest_framework.response import Response
 from questionnaire.models import *
 from questionnaire.serializers import *
 from questionnaire.permissions import *
+from questionnaire.utils import submit_answersheet
 
 
 # 用viewsets
@@ -158,6 +159,12 @@ class AnswerSheetViewSet(viewsets.ModelViewSet):
             raise PermissionError("禁止重复创建答卷！")
         else:
             serializer.save()
+
+    @action(detail=True, methods=['POST'])
+    def submit(self, request, *args, **kwargs):
+        sheet = self.get_object()
+        submitted = submit_answersheet(sheet.pk, request.user)
+        return Response(self.get_serializer(submitted).data)
 
     @action(detail=False, methods=['GET'])
     def answer_owner(self, request):

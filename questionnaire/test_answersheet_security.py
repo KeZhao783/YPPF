@@ -6,7 +6,13 @@ from rest_framework import status
 from rest_framework.test import APIClient
 
 from generic.models import User
-from questionnaire.models import AnswerSheet, Survey
+from questionnaire.models import (
+    AnswerSheet,
+    AnswerText,
+    Choice,
+    Question,
+    Survey,
+)
 
 
 class AnswerSheetApiSecurityTests(TestCase):
@@ -144,3 +150,295 @@ class AnswerSheetApiSecurityTests(TestCase):
             reverse("answersheet-detail", args=[self.submitted.pk]))
 
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+
+class AnswerSheetSubmitTests(TestCase):
+    @classmethod
+    def setUpTestData(cls):
+        cls.asker = User.objects.create_user(
+            username="v10_submit_asker",
+            name="V10 Submit Asker",
+            password="test-password",
+        )
+        cls.respondent = User.objects.create_user(
+            username="v10_submit_respondent",
+            name="V10 Submit Respondent",
+            password="test-password",
+        )
+        cls.unrelated = User.objects.create_user(
+            username="v10_submit_unrelated",
+            name="V10 Submit Unrelated",
+            password="test-password",
+        )
+        cls.staff = User.objects.create_user(
+            username="v10_submit_staff",
+            name="V10 Submit Staff",
+            password="test-password",
+            is_staff=True,
+        )
+        cls.now = datetime.now()
+        cls.survey = Survey.objects.create(
+            title="V10 submit survey",
+            creator=cls.asker,
+            status=Survey.Status.PUBLISHED,
+            start_time=cls.now - timedelta(days=1),
+            end_time=cls.now + timedelta(days=1),
+        )
+        cls.required_question = Question.objects.create(
+            survey=cls.survey,
+            order=1,
+            topic="Required text",
+            type=Question.Type.TEXT,
+            required=True,
+        )
+        cls.choice_question = Question.objects.create(
+            survey=cls.survey,
+            order=2,
+            topic="Optional choice",
+            type=Question.Type.SINGLE,
+            required=False,
+        )
+        Choice.objects.create(
+            question=cls.choice_question,
+            order=1,
+            text="Valid",
+        )
+        cls.draft = AnswerSheet.objects.create(
+            survey=cls.survey,
+            creator=cls.respondent,
+        )
+        cls.required_answer = AnswerText.objects.create(
+            question=cls.required_question,
+            answersheet=cls.draft,
+            body="complete",
+        )
+        cls.submitted = AnswerSheet.objects.create(
+            survey=cls.survey,
+            creator=cls.respondent,
+            status=AnswerSheet.Status.SUBMITTED,
+        )
+        AnswerText.objects.create(
+            question=cls.required_question,
+            answersheet=cls.submitted,
+            body="already submitted",
+        )
+
+    def setUp(self):
+        self.client = APIClient()
+
+    def _submit(self, sheet=None):
+        target = self.draft if sheet is None else sheet
+        return self.client.post(
+            f"/questionnaire/answersheet/{target.pk}/submit/",
+            {},
+            format="json",
+        )
+
+    def _new_draft(self, survey=None):
+        target_survey = self.survey if survey is None else survey
+        return AnswerSheet.objects.create(
+            survey=target_survey,
+            creator=self.respondent,
+        )
+
+    def test_owner_submits_complete_draft(self):
+        self.client.force_login(self.respondent)
+
+        response = self._submit()
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.draft.refresh_from_db()
+        self.assertEqual(self.draft.status, AnswerSheet.Status.SUBMITTED)
+        self.assertEqual(response.data["status"], AnswerSheet.Status.SUBMITTED)
+
+    def test_nonowners_cannot_submit_respondent_draft(self):
+        for actor in (self.asker, self.unrelated, self.staff):
+            with self.subTest(actor=actor.username):
+                self.client.force_login(actor)
+
+                response = self._submit()
+
+                self.assertEqual(
+                    response.status_code,
+                    status.HTTP_404_NOT_FOUND,
+                )
+                self.draft.refresh_from_db()
+                self.assertEqual(
+                    self.draft.status,
+                    AnswerSheet.Status.DRAFT,
+                )
+
+    def test_anonymous_user_cannot_submit(self):
+        response = self._submit()
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.draft.refresh_from_db()
+        self.assertEqual(self.draft.status, AnswerSheet.Status.DRAFT)
+
+    def test_session_submit_requires_csrf(self):
+        csrf_client = APIClient(enforce_csrf_checks=True)
+        logged_in = csrf_client.login(
+            username=self.respondent.username,
+            password="test-password",
+        )
+        self.assertTrue(logged_in)
+
+        response = csrf_client.post(
+            f"/questionnaire/answersheet/{self.draft.pk}/submit/",
+            {},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.draft.refresh_from_db()
+        self.assertEqual(self.draft.status, AnswerSheet.Status.DRAFT)
+
+    def test_repeated_submit_is_rejected(self):
+        self.client.force_login(self.respondent)
+
+        response = self._submit(self.submitted)
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.submitted.refresh_from_db()
+        self.assertEqual(
+            self.submitted.status,
+            AnswerSheet.Status.SUBMITTED,
+        )
+
+    def test_missing_required_answer_does_not_submit(self):
+        self.required_answer.delete()
+        self.client.force_login(self.respondent)
+
+        response = self._submit()
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.draft.refresh_from_db()
+        self.assertEqual(self.draft.status, AnswerSheet.Status.DRAFT)
+        self.assertFalse(
+            AnswerText.objects.filter(answersheet=self.draft).exists())
+
+    def test_survey_state_and_time_window_are_enforced(self):
+        cases = [
+            (
+                "not-published",
+                Survey.Status.REVIEWING,
+                self.now - timedelta(days=1),
+                self.now + timedelta(days=1),
+            ),
+            (
+                "not-started",
+                Survey.Status.PUBLISHED,
+                self.now + timedelta(days=1),
+                self.now + timedelta(days=2),
+            ),
+            (
+                "expired",
+                Survey.Status.PUBLISHED,
+                self.now - timedelta(days=2),
+                self.now - timedelta(days=1),
+            ),
+        ]
+        self.client.force_login(self.respondent)
+        for name, survey_status, start_time, end_time in cases:
+            with self.subTest(case=name):
+                survey = Survey.objects.create(
+                    title=f"V10 submit {name}",
+                    creator=self.asker,
+                    status=survey_status,
+                    start_time=start_time,
+                    end_time=end_time,
+                )
+                question = Question.objects.create(
+                    survey=survey,
+                    order=1,
+                    topic=f"Required {name}",
+                    type=Question.Type.TEXT,
+                    required=True,
+                )
+                sheet = self._new_draft(survey)
+                AnswerText.objects.create(
+                    question=question,
+                    answersheet=sheet,
+                    body="complete",
+                )
+
+                response = self._submit(sheet)
+
+                self.assertEqual(
+                    response.status_code,
+                    status.HTTP_400_BAD_REQUEST,
+                )
+                sheet.refresh_from_db()
+                self.assertEqual(sheet.status, AnswerSheet.Status.DRAFT)
+
+    def test_duplicate_answers_do_not_submit(self):
+        AnswerText.objects.create(
+            question=self.required_question,
+            answersheet=self.draft,
+            body="duplicate",
+        )
+        self.client.force_login(self.respondent)
+
+        response = self._submit()
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.draft.refresh_from_db()
+        self.assertEqual(self.draft.status, AnswerSheet.Status.DRAFT)
+        self.assertEqual(
+            AnswerText.objects.filter(answersheet=self.draft).count(),
+            2,
+        )
+
+    def test_cross_survey_answer_does_not_submit(self):
+        other_survey = Survey.objects.create(
+            title="V10 other survey",
+            creator=self.asker,
+            status=Survey.Status.PUBLISHED,
+            start_time=self.now - timedelta(days=1),
+            end_time=self.now + timedelta(days=1),
+        )
+        other_question = Question.objects.create(
+            survey=other_survey,
+            order=1,
+            topic="Other question",
+            type=Question.Type.TEXT,
+        )
+        AnswerText.objects.create(
+            question=other_question,
+            answersheet=self.draft,
+            body="cross survey",
+        )
+        self.client.force_login(self.respondent)
+
+        response = self._submit()
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.draft.refresh_from_db()
+        self.assertEqual(self.draft.status, AnswerSheet.Status.DRAFT)
+
+    def test_empty_stored_answer_does_not_submit(self):
+        self.required_answer.body = ""
+        self.required_answer.save(update_fields=["body"])
+        self.client.force_login(self.respondent)
+
+        response = self._submit()
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.draft.refresh_from_db()
+        self.required_answer.refresh_from_db()
+        self.assertEqual(self.draft.status, AnswerSheet.Status.DRAFT)
+        self.assertEqual(self.required_answer.body, "")
+
+    def test_invalid_choice_answer_does_not_submit(self):
+        AnswerText.objects.create(
+            question=self.choice_question,
+            answersheet=self.draft,
+            body="99",
+        )
+        self.client.force_login(self.respondent)
+
+        response = self._submit()
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.draft.refresh_from_db()
+        self.assertEqual(self.draft.status, AnswerSheet.Status.DRAFT)
