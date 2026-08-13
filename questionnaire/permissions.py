@@ -10,16 +10,19 @@ __all__ = [
     'IsChoiceOwnerOrReadOnly',
 ]
 
-
-def check_owner_or_asker(request, owner, asker):
-    return request.user.is_staff or request.user == owner or request.user == asker
-
-
 class IsTextOwnerOrAsker(permissions.BasePermission):
     def has_object_permission(self, request, view, obj):
-        owner = obj.answersheet.creator
-        asker = obj.question.survey.creator
-        return check_owner_or_asker(request, owner, asker)
+        sheet = obj.answersheet
+        if request.user == sheet.creator:
+            return (
+                request.method in permissions.SAFE_METHODS
+                or sheet.status == AnswerSheet.Status.DRAFT
+            )
+        return (
+            request.method in permissions.SAFE_METHODS
+            and sheet.status == AnswerSheet.Status.SUBMITTED
+            and request.user == sheet.survey.creator
+        )
 
 
 class IsSheetOwnerOrAsker(permissions.BasePermission):

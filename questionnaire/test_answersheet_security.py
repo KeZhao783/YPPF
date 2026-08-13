@@ -442,3 +442,286 @@ class AnswerSheetSubmitTests(TestCase):
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.draft.refresh_from_db()
         self.assertEqual(self.draft.status, AnswerSheet.Status.DRAFT)
+
+
+class AnswerTextSecurityTests(TestCase):
+    @classmethod
+    def setUpTestData(cls):
+        cls.asker = User.objects.create_user(
+            username="v10_text_asker",
+            name="V10 Text Asker",
+            password="test-password",
+        )
+        cls.respondent = User.objects.create_user(
+            username="v10_text_respondent",
+            name="V10 Text Respondent",
+            password="test-password",
+        )
+        cls.unrelated = User.objects.create_user(
+            username="v10_text_unrelated",
+            name="V10 Text Unrelated",
+            password="test-password",
+        )
+        cls.staff = User.objects.create_user(
+            username="v10_text_staff",
+            name="V10 Text Staff",
+            password="test-password",
+            is_staff=True,
+        )
+        now = datetime.now()
+        cls.survey = Survey.objects.create(
+            title="V10 answer text survey",
+            creator=cls.asker,
+            status=Survey.Status.PUBLISHED,
+            start_time=now - timedelta(days=1),
+            end_time=now + timedelta(days=1),
+        )
+        cls.primary_question = Question.objects.create(
+            survey=cls.survey,
+            order=1,
+            topic="Primary text",
+            type=Question.Type.TEXT,
+        )
+        cls.optional_question = Question.objects.create(
+            survey=cls.survey,
+            order=2,
+            topic="Optional text",
+            type=Question.Type.TEXT,
+            required=False,
+        )
+        cls.draft = AnswerSheet.objects.create(
+            survey=cls.survey,
+            creator=cls.respondent,
+        )
+        cls.submitted = AnswerSheet.objects.create(
+            survey=cls.survey,
+            creator=cls.respondent,
+            status=AnswerSheet.Status.SUBMITTED,
+        )
+        cls.draft_answer = AnswerText.objects.create(
+            question=cls.primary_question,
+            answersheet=cls.draft,
+            body="draft body",
+        )
+        cls.submitted_answer = AnswerText.objects.create(
+            question=cls.primary_question,
+            answersheet=cls.submitted,
+            body="submitted body",
+        )
+
+    def setUp(self):
+        self.client = APIClient()
+        self.client.raise_request_exception = False
+
+    def test_owner_can_create_sparse_update_and_delete_answer_in_draft(self):
+        self.client.force_login(self.respondent)
+
+        create_response = self.client.post(
+            reverse("answertext-list"),
+            {
+                "question": self.optional_question.pk,
+                "answersheet": self.draft.pk,
+                "body": "optional body",
+            },
+            format="json",
+        )
+        self.assertEqual(
+            create_response.status_code,
+            status.HTTP_201_CREATED,
+        )
+        answer_id = create_response.data["id"]
+
+        update_response = self.client.patch(
+            reverse("answertext-detail", args=[answer_id]),
+            {"body": "updated body"},
+            format="json",
+        )
+        self.assertEqual(update_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            AnswerText.objects.get(pk=answer_id).body,
+            "updated body",
+        )
+
+        delete_response = self.client.delete(
+            reverse("answertext-detail", args=[answer_id]))
+        self.assertEqual(
+            delete_response.status_code,
+            status.HTTP_204_NO_CONTENT,
+        )
+        self.assertFalse(AnswerText.objects.filter(pk=answer_id).exists())
+
+    def test_submitted_sheet_rejects_answer_create(self):
+        self.client.force_login(self.respondent)
+
+        response = self.client.post(
+            reverse("answertext-list"),
+            {
+                "question": self.optional_question.pk,
+                "answersheet": self.submitted.pk,
+                "body": "late answer",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertFalse(AnswerText.objects.filter(
+            question=self.optional_question,
+            answersheet=self.submitted,
+        ).exists())
+
+    def test_submitted_sheet_rejects_answer_update(self):
+        self.client.force_login(self.respondent)
+
+        response = self.client.patch(
+            reverse(
+                "answertext-detail",
+                args=[self.submitted_answer.pk],
+            ),
+            {"body": "changed after submit"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.submitted_answer.refresh_from_db()
+        self.assertEqual(self.submitted_answer.body, "submitted body")
+
+    def test_submitted_sheet_rejects_answer_delete(self):
+        self.client.force_login(self.respondent)
+
+        response = self.client.delete(reverse(
+            "answertext-detail",
+            args=[self.submitted_answer.pk],
+        ))
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertTrue(AnswerText.objects.filter(
+            pk=self.submitted_answer.pk).exists())
+
+    def test_nonowners_cannot_create_draft_answer(self):
+        for actor in (self.asker, self.unrelated, self.staff):
+            with self.subTest(actor=actor.username):
+                self.client.force_login(actor)
+
+                response = self.client.post(
+                    reverse("answertext-list"),
+                    {
+                        "question": self.optional_question.pk,
+                        "answersheet": self.draft.pk,
+                        "body": f"created by {actor.username}",
+                    },
+                    format="json",
+                )
+
+                self.assertEqual(
+                    response.status_code,
+                    status.HTTP_403_FORBIDDEN,
+                )
+                self.assertFalse(AnswerText.objects.filter(
+                    question=self.optional_question,
+                    answersheet=self.draft,
+                ).exists())
+
+    def test_nonowners_cannot_update_draft_answer(self):
+        for actor in (self.asker, self.unrelated, self.staff):
+            with self.subTest(actor=actor.username):
+                self.client.force_login(actor)
+
+                response = self.client.patch(
+                    reverse(
+                        "answertext-detail",
+                        args=[self.draft_answer.pk],
+                    ),
+                    {"body": f"changed by {actor.username}"},
+                    format="json",
+                )
+
+                self.assertEqual(
+                    response.status_code,
+                    status.HTTP_404_NOT_FOUND,
+                )
+                self.draft_answer.refresh_from_db()
+                self.assertEqual(self.draft_answer.body, "draft body")
+
+    def test_nonowners_cannot_delete_draft_answer(self):
+        for index, actor in enumerate(
+            (self.asker, self.unrelated, self.staff),
+            start=10,
+        ):
+            with self.subTest(actor=actor.username):
+                question = Question.objects.create(
+                    survey=self.survey,
+                    order=index,
+                    topic=f"Delete target {index}",
+                    type=Question.Type.TEXT,
+                )
+                answer = AnswerText.objects.create(
+                    question=question,
+                    answersheet=self.draft,
+                    body="must remain",
+                )
+                self.client.force_login(actor)
+
+                response = self.client.delete(reverse(
+                    "answertext-detail",
+                    args=[answer.pk],
+                ))
+
+                self.assertEqual(
+                    response.status_code,
+                    status.HTTP_404_NOT_FOUND,
+                )
+                self.assertTrue(
+                    AnswerText.objects.filter(pk=answer.pk).exists())
+
+    def test_survey_owner_sees_only_submitted_answers(self):
+        self.client.force_login(self.asker)
+
+        response = self.client.get(reverse("answertext-survey-owner"))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            [row["id"] for row in response.data],
+            [self.submitted_answer.pk],
+        )
+
+    def test_survey_owner_can_retrieve_only_submitted_answer(self):
+        self.client.force_login(self.asker)
+
+        submitted_response = self.client.get(reverse(
+            "answertext-detail",
+            args=[self.submitted_answer.pk],
+        ))
+        draft_response = self.client.get(reverse(
+            "answertext-detail",
+            args=[self.draft_answer.pk],
+        ))
+
+        self.assertEqual(
+            submitted_response.status_code,
+            status.HTTP_200_OK,
+        )
+        self.assertEqual(
+            draft_response.status_code,
+            status.HTTP_404_NOT_FOUND,
+        )
+
+    def test_staff_has_no_answer_text_read_bypass(self):
+        self.client.force_login(self.staff)
+
+        response = self.client.get(reverse(
+            "answertext-detail",
+            args=[self.submitted_answer.pk],
+        ))
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_answer_owner_reads_own_draft_and_submitted_answers(self):
+        self.client.force_login(self.respondent)
+
+        response = self.client.get(reverse("answertext-answer-owner"))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(
+            {row["id"] for row in response.data},
+            {self.draft_answer.pk, self.submitted_answer.pk},
+        )

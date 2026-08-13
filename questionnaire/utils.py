@@ -9,6 +9,15 @@ from questionnaire.models import AnswerSheet, AnswerText, Survey
 from questionnaire.validators import validate_answer_body
 
 
+def lock_draft_answersheet(sheet_id, actor):
+    sheet = AnswerSheet.objects.select_for_update().get(pk=sheet_id)
+    if sheet.creator_id != actor.pk:
+        raise PermissionDenied("只有答卷创建者才能修改答案！")
+    if sheet.status != AnswerSheet.Status.DRAFT:
+        raise serializers.ValidationError("已提交答卷不能修改答案！")
+    return sheet
+
+
 def submit_answersheet(sheet_id, actor, now=None):
     now = datetime.now() if now is None else now
     with transaction.atomic():
