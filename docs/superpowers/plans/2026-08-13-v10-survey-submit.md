@@ -15,7 +15,8 @@
 - Disable answer-sheet PUT and PATCH; do not retain a compatibility status-write path.
 - Use naive local datetime.now() because project USE_TZ is false.
 - Exercise real DRF routing, session authentication, CSRF, models, and database behavior in tests.
-- Keep changes confined to questionnaire code and V10 documentation.
+- Keep changes confined to questionnaire code, the existing dormitory caller,
+  its regression tests, and V10 documentation.
 
 ---
 
@@ -338,3 +339,25 @@ KeZhao783:fix/v10-survey-submit to Yuanpei-Intelligence/YPPF:develop titled
 "fix: secure survey answer submission (V10)". The PR body must state the
 security boundary, compatibility change, fresh test evidence, and absence of
 migrations.
+
+---
+
+### Review follow-up: Existing caller and lock proof
+
+**Files:**
+- Modify: `dormitory/views.py`
+- Modify: `dormitory/tests.py`
+- Modify: `questionnaire/validators.py`
+- Modify: `questionnaire/utils.py`
+- Modify: `questionnaire/test_answersheet_security.py`
+
+- [x] Add a dormitory regression proving a valid response becomes
+  `SUBMITTED` and is visible to the survey creator.
+- [x] Call `submit_answersheet()` from the dormitory transaction after all
+  answer rows have been created.
+- [x] Add `TransactionTestCase` coverage with separate database connections
+  for create, update, and delete racing a submission.
+- [x] Reuse prefetched choice orders during submission and assert that a
+  multi-choice-question sheet performs only one choice query.
+- [x] Keep existing drafts untouched and document why automatic promotion is
+  unsafe and outside the no-migration scope.

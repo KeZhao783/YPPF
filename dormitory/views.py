@@ -12,6 +12,7 @@ from dormitory.serializers import (
     DormitoryAssignmentSerializer, DormitorySerializer,
     AgreementSerializerFixme, AgreementSerializer)
 from questionnaire.models import AnswerSheet, AnswerText, Question, Survey
+from questionnaire.utils import submit_answersheet
 from questionnaire.validators import validate_answer_body
 from django.core.exceptions import ValidationError
 from django.http import HttpResponse
@@ -161,6 +162,7 @@ class DormitoryRoutineQAView(ProfileTemplateView):
                 AnswerText.objects.create(question=question,
                                           answersheet=sheet,
                                           body=answer)
+            submit_answersheet(sheet.pk, self.request.user)
         return self.render(submitted=True)
 
 

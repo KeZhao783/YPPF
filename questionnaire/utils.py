@@ -44,6 +44,14 @@ def submit_answersheet(sheet_id, actor, now=None):
             question.pk: question
             for question in questions
         }
+        valid_choice_orders = {
+            question.pk: {
+                choice.order
+                for choice in question.choices.all()
+            }
+            for question in questions
+            if question.have_choice()
+        }
         answer_by_question = {}
         for answer in AnswerText.objects.filter(answersheet=sheet):
             question = question_by_id.get(answer.question_id)
@@ -58,7 +66,11 @@ def submit_answersheet(sheet_id, actor, now=None):
             if not body:
                 raise serializers.ValidationError("答案不能为空！")
             try:
-                validate_answer_body(question, body)
+                validate_answer_body(
+                    question,
+                    body,
+                    valid_choice_orders.get(question.pk),
+                )
             except DjangoValidationError as exc:
                 raise serializers.ValidationError(exc.messages) from exc
             answer_by_question[question.pk] = answer

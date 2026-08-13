@@ -1,7 +1,10 @@
 from datetime import datetime, timedelta
+from threading import Event, Thread
 
+from django.db import close_old_connections, connection
+from django.test import TestCase, TransactionTestCase
+from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
-from django.test import TestCase
 from rest_framework import status
 from rest_framework.test import APIClient
 
@@ -13,6 +16,7 @@ from questionnaire.models import (
     Question,
     Survey,
 )
+from questionnaire.utils import submit_answersheet
 
 
 class AnswerSheetApiSecurityTests(TestCase):
@@ -443,6 +447,40 @@ class AnswerSheetSubmitTests(TestCase):
         self.draft.refresh_from_db()
         self.assertEqual(self.draft.status, AnswerSheet.Status.DRAFT)
 
+    def test_submit_reuses_prefetched_choices(self):
+        second_choice_question = Question.objects.create(
+            survey=self.survey,
+            order=3,
+            topic="Second optional choice",
+            type=Question.Type.SINGLE,
+            required=False,
+        )
+        Choice.objects.create(
+            question=second_choice_question,
+            order=1,
+            text="Second valid choice",
+        )
+        AnswerText.objects.create(
+            question=self.choice_question,
+            answersheet=self.draft,
+            body="1",
+        )
+        AnswerText.objects.create(
+            question=second_choice_question,
+            answersheet=self.draft,
+            body="1",
+        )
+
+        with CaptureQueriesContext(connection) as queries:
+            submit_answersheet(self.draft.pk, self.respondent, now=self.now)
+
+        choice_queries = [
+            query["sql"]
+            for query in queries.captured_queries
+            if "questionnaire_choice" in query["sql"].lower()
+        ]
+        self.assertEqual(len(choice_queries), 1, choice_queries)
+
 
 class AnswerTextSecurityTests(TestCase):
     @classmethod
@@ -725,3 +763,192 @@ class AnswerTextSecurityTests(TestCase):
             {row["id"] for row in response.data},
             {self.draft_answer.pk, self.submitted_answer.pk},
         )
+
+
+class AnswerSheetConcurrencyTests(TransactionTestCase):
+    def setUp(self):
+        self.asker = User.objects.create_user(
+            username="v10_race_asker",
+            name="V10 Race Asker",
+        )
+        self.respondent = User.objects.create_user(
+            username="v10_race_respondent",
+            name="V10 Race Respondent",
+        )
+        now = datetime.now()
+        self.survey = Survey.objects.create(
+            title="V10 race survey",
+            creator=self.asker,
+            status=Survey.Status.PUBLISHED,
+            start_time=now - timedelta(days=1),
+            end_time=now + timedelta(days=1),
+        )
+        self.required_question = Question.objects.create(
+            survey=self.survey,
+            order=1,
+            topic="Required answer",
+            type=Question.Type.TEXT,
+            required=True,
+        )
+        self.optional_question = Question.objects.create(
+            survey=self.survey,
+            order=2,
+            topic="Optional answer",
+            type=Question.Type.TEXT,
+            required=False,
+        )
+        self.sheet = AnswerSheet.objects.create(
+            survey=self.survey,
+            creator=self.respondent,
+        )
+        self.required_answer = AnswerText.objects.create(
+            question=self.required_question,
+            answersheet=self.sheet,
+            body="committed before submit",
+        )
+
+    @staticmethod
+    def _is_sheet_lock(sql):
+        normalized = " ".join(sql.upper().split())
+        return (
+            "FOR UPDATE" in normalized
+            and "QUESTIONNAIRE_ANSWERSHEET" in normalized
+        )
+
+    def _race_submit_against_mutation(self, method, path, data=None):
+        submit_has_lock = Event()
+        allow_submit = Event()
+        mutation_attempted_lock = Event()
+        mutation_done = Event()
+        results = {}
+        errors = []
+        submit_paused = {"value": False}
+        mutation_signaled = {"value": False}
+
+        def pause_submit_after_lock(execute, sql, params, many, context):
+            result = execute(sql, params, many, context)
+            if (
+                not submit_paused["value"]
+                and self._is_sheet_lock(sql)
+            ):
+                submit_paused["value"] = True
+                submit_has_lock.set()
+                if not allow_submit.wait(10):
+                    raise TimeoutError("submit lock was not released by test")
+            return result
+
+        def signal_mutation_lock_attempt(execute, sql, params, many, context):
+            if (
+                not mutation_signaled["value"]
+                and self._is_sheet_lock(sql)
+            ):
+                mutation_signaled["value"] = True
+                mutation_attempted_lock.set()
+            return execute(sql, params, many, context)
+
+        def submit_worker():
+            close_old_connections()
+            client = APIClient()
+            client.force_authenticate(user=self.respondent)
+            try:
+                with connection.execute_wrapper(pause_submit_after_lock):
+                    response = client.post(
+                        reverse("answersheet-submit", args=[self.sheet.pk]),
+                        {},
+                        format="json",
+                    )
+                results["submit"] = response.status_code
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                close_old_connections()
+
+        def mutation_worker():
+            close_old_connections()
+            client = APIClient()
+            client.force_authenticate(user=self.respondent)
+            try:
+                with connection.execute_wrapper(signal_mutation_lock_attempt):
+                    request_method = getattr(client, method)
+                    response = request_method(path, data or {}, format="json")
+                results["mutation"] = response.status_code
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                mutation_done.set()
+                close_old_connections()
+
+        submit_thread = Thread(target=submit_worker)
+        mutation_thread = Thread(target=mutation_worker)
+        submit_thread.start()
+        mutation_started = False
+        try:
+            self.assertTrue(
+                submit_has_lock.wait(10),
+                "submit did not acquire the answer-sheet row lock",
+            )
+            mutation_thread.start()
+            mutation_started = True
+            self.assertTrue(
+                mutation_attempted_lock.wait(10),
+                "answer mutation did not attempt the same row lock",
+            )
+            self.assertFalse(
+                mutation_done.wait(0.25),
+                "answer mutation completed while submit held the row lock",
+            )
+        finally:
+            allow_submit.set()
+            submit_thread.join(10)
+            if mutation_started:
+                mutation_thread.join(10)
+
+        self.assertFalse(submit_thread.is_alive(), "submit thread did not finish")
+        self.assertFalse(
+            mutation_thread.is_alive(),
+            "answer mutation thread did not finish",
+        )
+        if errors:
+            raise errors[0]
+        self.assertEqual(results["submit"], status.HTTP_200_OK)
+        self.assertEqual(results["mutation"], status.HTTP_400_BAD_REQUEST)
+        self.sheet.refresh_from_db()
+        self.assertEqual(self.sheet.status, AnswerSheet.Status.SUBMITTED)
+
+    def test_submit_wins_race_against_answer_create(self):
+        self._race_submit_against_mutation(
+            "post",
+            reverse("answertext-list"),
+            {
+                "question": self.optional_question.pk,
+                "answersheet": self.sheet.pk,
+                "body": "must be rejected",
+            },
+        )
+
+        self.assertFalse(AnswerText.objects.filter(
+            answersheet=self.sheet,
+            question=self.optional_question,
+        ).exists())
+
+    def test_submit_wins_race_against_answer_update(self):
+        self._race_submit_against_mutation(
+            "patch",
+            reverse("answertext-detail", args=[self.required_answer.pk]),
+            {"body": "must be rejected"},
+        )
+
+        self.required_answer.refresh_from_db()
+        self.assertEqual(
+            self.required_answer.body,
+            "committed before submit",
+        )
+
+    def test_submit_wins_race_against_answer_delete(self):
+        self._race_submit_against_mutation(
+            "delete",
+            reverse("answertext-detail", args=[self.required_answer.pk]),
+        )
+
+        self.assertTrue(
+            AnswerText.objects.filter(pk=self.required_answer.pk).exists())

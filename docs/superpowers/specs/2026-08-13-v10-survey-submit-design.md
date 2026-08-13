@@ -23,7 +23,9 @@ This is the minimum security repair approved for V10:
 - allow `AnswerText` create, update, and delete only when the caller owns the
   answer sheet and it is still `DRAFT`;
 - serialize answer mutations with submission by locking the same answer-sheet
-  row before each mutation.
+  row before each mutation;
+- route the existing dormitory routine-questionnaire workflow through the
+  same canonical submission transition.
 
 There are no model changes or migrations. The change does not add audit
 records, withdrawal, a new state, compatibility support for generic status
@@ -107,6 +109,10 @@ serialize on the same database row: whichever operation gets the lock first
 finishes under its valid preconditions; the second operation re-reads and
 checks the resulting state.
 
+The dormitory routine-questionnaire view creates the sheet and answers, then
+calls this transition inside the same outer transaction. A validation failure
+therefore rolls back the entire response instead of leaving a partial draft.
+
 ## Authorization Layers
 
 The queryset is the first visibility boundary and is selected by action:
@@ -142,7 +148,13 @@ They cover:
 - survey-owner reads contain only submitted sheets and answers;
 - answer create/update/delete succeeds for the owner of a draft and fails for
   other roles or a submitted sheet;
-- submission failures do not partially update the sheet or its answers.
+- submission failures do not partially update the sheet or its answers;
+- separate database connections prove that create, update, and delete block
+  on a concurrent submission and reject their mutation after it commits;
+- the dormitory workflow produces a submitted sheet visible to the survey
+  creator;
+- a multi-choice-question submission reuses its prefetched choices instead of
+  querying choices once per answer while holding the sheet lock.
 
 The questionnaire tests run first during development, followed by the full
 Django suite and `makemigrations --check --dry-run` before the PR is created.
@@ -155,3 +167,10 @@ repository was checked and currently contains no references to the
 questionnaire answer-sheet or answer-text endpoints. Retaining status PATCH as
 a compatibility path would preserve the vulnerable contract and is therefore
 out of scope.
+
+Existing `DRAFT` rows are deliberately not migrated. The database does not
+record whether an old draft represents a completed legacy dormitory response
+or a genuinely incomplete answer, so automatically promoting all of them
+would expose unsubmitted data. They remain hidden from survey-creator result
+endpoints and require a separately reviewed data audit if historical results
+must be recovered.
