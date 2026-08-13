@@ -1,6 +1,5 @@
 from django.db import transaction
 from rest_framework import viewsets
-from rest_framework.authentication import SessionAuthentication
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
@@ -25,7 +24,6 @@ class DormitoryViewSet(viewsets.ReadOnlyModelViewSet):
 
 
 class DormitoryAssignmentViewSet(viewsets.ReadOnlyModelViewSet):
-    authentication_classes = [SessionAuthentication]
     permission_classes = [IsAuthenticated]
     serializer_class = DormitoryAssignmentSerializer
 
@@ -41,7 +39,6 @@ class DormitoryAssignmentViewSet(viewsets.ReadOnlyModelViewSet):
 
 
 class DormitoryAgreementViewSetFixme(viewsets.ReadOnlyModelViewSet):
-    authentication_classes = [SessionAuthentication]
     permission_classes = [IsAuthenticated]
     serializer_class = AgreementSerializerFixme
 
@@ -65,7 +62,6 @@ class DormitoryAgreementViewSetFixme(viewsets.ReadOnlyModelViewSet):
 
 
 class DormitoryAgreementViewSet(viewsets.ReadOnlyModelViewSet):
-    authentication_classes = [SessionAuthentication]
     permission_classes = [IsAuthenticated]
     serializer_class = AgreementSerializer
 
