@@ -28,7 +28,12 @@ class IsTextOwnerOrAsker(permissions.BasePermission):
 class IsSheetOwnerOrAsker(permissions.BasePermission):
     def has_object_permission(self, request, view, obj):
         if request.user == obj.creator:
-            return True
+            if (
+                request.method in permissions.SAFE_METHODS
+                or view.action == 'submit'
+            ):
+                return True
+            return obj.status == AnswerSheet.Status.DRAFT
         return (
             request.method in permissions.SAFE_METHODS
             and obj.status == AnswerSheet.Status.SUBMITTED

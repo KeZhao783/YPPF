@@ -8,13 +8,19 @@ from rest_framework.exceptions import PermissionDenied
 from questionnaire.models import AnswerSheet, AnswerText, Survey
 from questionnaire.validators import validate_answer_body
 
+__all__ = [
+    'lock_draft_answersheet',
+    'submit_answersheet',
+]
+
 
 def lock_draft_answersheet(sheet_id, actor):
+    """Lock a sheet row and require it still be a draft owned by actor."""
     sheet = AnswerSheet.objects.select_for_update().get(pk=sheet_id)
     if sheet.creator_id != actor.pk:
-        raise PermissionDenied("只有答卷创建者才能修改答案！")
+        raise PermissionDenied("只有答卷创建者才能修改答卷！")
     if sheet.status != AnswerSheet.Status.DRAFT:
-        raise serializers.ValidationError("已提交答卷不能修改答案！")
+        raise serializers.ValidationError("已提交答卷不能修改！")
     return sheet
 
 

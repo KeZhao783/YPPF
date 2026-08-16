@@ -155,6 +155,98 @@ class AnswerSheetApiSecurityTests(TestCase):
 
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
+    def test_owner_can_delete_draft_sheet(self):
+        question = Question.objects.create(
+            survey=self.survey,
+            order=99,
+            topic="Draft delete target",
+            type=Question.Type.TEXT,
+            required=False,
+        )
+        sheet = AnswerSheet.objects.create(
+            survey=self.survey,
+            creator=self.respondent,
+        )
+        answer = AnswerText.objects.create(
+            question=question,
+            answersheet=sheet,
+            body="will be cascaded",
+        )
+        self.client.force_login(self.respondent)
+
+        response = self.client.delete(
+            reverse("answersheet-detail", args=[sheet.pk]))
+
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertFalse(AnswerSheet.objects.filter(pk=sheet.pk).exists())
+        self.assertFalse(AnswerText.objects.filter(pk=answer.pk).exists())
+
+    def test_submitted_sheet_rejects_delete(self):
+        question = Question.objects.create(
+            survey=self.survey,
+            order=100,
+            topic="Submitted delete target",
+            type=Question.Type.TEXT,
+            required=False,
+        )
+        answer = AnswerText.objects.create(
+            question=question,
+            answersheet=self.submitted,
+            body="must remain after delete attempt",
+        )
+        self.client.force_login(self.respondent)
+
+        response = self.client.delete(
+            reverse("answersheet-detail", args=[self.submitted.pk]))
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertTrue(
+            AnswerSheet.objects.filter(pk=self.submitted.pk).exists())
+        self.assertTrue(AnswerText.objects.filter(pk=answer.pk).exists())
+        self.submitted.refresh_from_db()
+        self.assertEqual(self.submitted.status, AnswerSheet.Status.SUBMITTED)
+
+    def test_nonowners_cannot_delete_answer_sheets(self):
+        targets = (
+            ("draft", self.draft),
+            ("submitted", self.submitted),
+        )
+        for actor in (self.asker, self.unrelated, self.staff):
+            for name, sheet in targets:
+                with self.subTest(actor=actor.username, sheet=name):
+                    self.client.force_login(actor)
+
+                    response = self.client.delete(
+                        reverse("answersheet-detail", args=[sheet.pk]))
+
+                    self.assertEqual(
+                        response.status_code,
+                        status.HTTP_404_NOT_FOUND,
+                    )
+                    self.assertTrue(
+                        AnswerSheet.objects.filter(pk=sheet.pk).exists())
+
+    def test_anonymous_user_cannot_delete_sheet(self):
+        response = self.client.delete(
+            reverse("answersheet-detail", args=[self.draft.pk]))
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertTrue(AnswerSheet.objects.filter(pk=self.draft.pk).exists())
+
+    def test_session_delete_requires_csrf(self):
+        csrf_client = APIClient(enforce_csrf_checks=True)
+        logged_in = csrf_client.login(
+            username=self.respondent.username,
+            password="test-password",
+        )
+        self.assertTrue(logged_in)
+
+        response = csrf_client.delete(
+            reverse("answersheet-detail", args=[self.draft.pk]))
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertTrue(AnswerSheet.objects.filter(pk=self.draft.pk).exists())
+
 
 class AnswerSheetSubmitTests(TestCase):
     @classmethod
@@ -952,3 +1044,15 @@ class AnswerSheetConcurrencyTests(TransactionTestCase):
 
         self.assertTrue(
             AnswerText.objects.filter(pk=self.required_answer.pk).exists())
+
+    def test_submit_wins_race_against_sheet_delete(self):
+        self._race_submit_against_mutation(
+            "delete",
+            reverse("answersheet-detail", args=[self.sheet.pk]),
+        )
+
+        self.assertTrue(AnswerSheet.objects.filter(pk=self.sheet.pk).exists())
+        self.assertTrue(
+            AnswerText.objects.filter(pk=self.required_answer.pk).exists())
+        self.sheet.refresh_from_db()
+        self.assertEqual(self.sheet.status, AnswerSheet.Status.SUBMITTED)

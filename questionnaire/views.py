@@ -206,6 +206,14 @@ class AnswerSheetViewSet(viewsets.ModelViewSet):
         else:
             serializer.save()
 
+    def perform_destroy(self, instance):
+        with transaction.atomic():
+            locked_sheet = lock_draft_answersheet(
+                instance.pk,
+                self.request.user,
+            )
+            locked_sheet.delete()
+
     @action(detail=True, methods=['POST'])
     def submit(self, request, *args, **kwargs):
         sheet = self.get_object()
