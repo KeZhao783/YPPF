@@ -9,6 +9,8 @@ from django.db import transaction
 from django.db.models import Q, F, Sum, QuerySet
 from django.contrib.auth.password_validation import CommonPasswordValidator, NumericPasswordValidator
 from django.core.exceptions import ValidationError
+from django.views.decorators.csrf import csrf_protect
+from django.views.decorators.http import require_http_methods
 
 from utils.config.cast import str_to_time
 from utils.marker import deprecated
@@ -35,13 +37,14 @@ from app.models import (
     AcademicQA,
     HomepageImage,
 )
+from app.password_reset_forms import PasswordResetForm, PasswordResetRequestForm
 from app.utils import (
     get_person_or_org,
     record_modify_with_session,
     update_related_account_in_session,
 )
 from extern.wechat import (
-    send_verify_code,
+    send_password_reset_token,
     invite_to_wechat,
 )
 from app.notification_utils import (
@@ -1431,151 +1434,98 @@ def search(request: HttpRequest):
     return render(request, "search.html", locals())
 
 
+@csrf_protect
+@require_http_methods(["GET", "POST"])
 @logger.secure_view()
 @utils.record_attack(Exception, as_attack=True)
 def forgetPassword(request: HttpRequest):
-    """
-        忘记密码页（Pylance可以提供文档字符串支持）
-
-        页面效果
-        -------
-        - 根据（邮箱）验证码完成登录，提交后跳转到修改密码界面
-        - 本质是登录而不是修改密码
-        - 如果改成支持验证码登录只需修改页面和跳转（记得修改函数和页面名）
-
-        页面逻辑
-        -------
-        1. 发送验证码
-            1.5 验证码冷却避免多次发送
-        2. 输入验证码
-            2.5 保留表单信息
-        3. 错误提醒和邮件发送提醒
-
-        实现逻辑
-        -------
-        - 通过脚本使按钮提供不同的`send_captcha`值，区分按钮
-        - 通过脚本实现验证码冷却，页面刷新后重置冷却（避免过长等待影响体验）
-        - 通过`session`保证安全传输验证码和待验证用户
-        - 成功发送/登录后才在`session`中记录信息
-        - 页面模板中实现消息提醒
-            - 消息提示现在与整体统一
-            - 添加`alert`表示需要提醒
-            - 添加`noshow`不在页面显示文字
-        - 尝试发送验证码后总是弹出提示框，通知用户验证码的发送情况
-
-        注意事项
-        -------
-        - 尝试忘记密码的不一定是本人，一定要做好隐私和逻辑处理
-            - 用户邮箱应当部分打码，避免向非本人提供隐私数据！
-        - 连接设置的timeout为6s
-        - 如果引入企业微信验证，建议将send_captcha分为'qywx'和'email'
-    """
+    """Request or consume a password-reset token without logging in."""
     if request.user.is_authenticated:
         return redirect("/welcome/")
 
-    if request.session.get("received_user"):
-        username = request.session["received_user"]  # 自动填充，方便跳转后继续
+    display = {}
+    username = ""
+    token = ""
     if request.method == "POST":
-        username = request.POST["username"]
-        send_captcha = request.POST["send_captcha"]
-        vertify_code = request.POST["vertify_code"]  # 用户输入的验证码
-
-        user = User.objects.filter(username=username)
-        if not user:
-            display = wrong("账号不存在")
-        elif len(user) != 1:
-            display = wrong("用户名不唯一，请联系管理员")
-        else:
-            user = user[0]
-            try:
-                person = NaturalPerson.objects.get_by_user(user)  # 目前只支持自然人
-            except:
-                display = wrong("暂不支持小组账号验证码登录！")
-                display["alert"] = True
-                return render(request, "forget_password.html", locals())
-            if send_captcha in ["yes", "email"]:    # 单个按钮(yes)发送邮件
-                email = person.email
-                if not email or email.lower() == "none" or "@" not in email:
-                    display = wrong(
-                        "您没有设置邮箱，请联系管理员"
-                        + "或发送姓名、学号和常用邮箱至gypjwb@pku.edu.cn进行修改"
-                    )  # TODO:记得填
-                else:
-                    captcha = utils.get_captcha(request, username)
-                    msg = (
-                        f"<h3><b>亲爱的{person.name}同学：</b></h3><br/>"
-                        "您好！您的账号正在进行邮箱验证，本次请求的验证码为：<br/>"
-                        f'<p style="color:orange">{captcha}'
-                        '<span style="color:gray">(仅'
-                        f'<a href="{request.build_absolute_uri()}">当前页面</a>'
-                        "有效)</span></p>"
-                        f'点击进入<a href="{request.build_absolute_uri("/")}">元培成长档案</a><br/>'
-                        "<br/>"
-                        "元培学院开发组<br/>" + datetime.now().strftime("%Y年%m月%d日")
-                    )
-                    post_data = {
-                        "sender": "元培学院开发组",  # 发件人标识
-                        "toaddrs": [email],  # 收件人列表
-                        "subject": "YPPF登录验证",  # 邮件主题/标题
-                        "content": msg,  # 邮件内容
-                        # 若subject为空, 第一个\n视为标题和内容的分隔符
-                        "html": True,  # 可选 如果为真则content被解读为html
-                        "private_level": 0,  # 可选 应在0-2之间
-                        # 影响显示的收件人信息
-                        # 0级全部显示, 1级只显示第一个收件人, 2级只显示发件人
-                        # content加密后的密文
-                        "secret": CONFIG.email.hasher.encode(msg),
-                    }
-                    post_data = json.dumps(post_data)
-                    pre, suf = email.rsplit("@", 1)
-                    if len(pre) > 5:
-                        pre = pre[:2] + "*" * len(pre[2:-3]) + pre[-3:]
-                    try:
-                        response = requests.post(
-                            CONFIG.email.url, post_data, timeout=6)
-                        response = response.json()
-                        if response["status"] != 200:
-                            display = wrong(f"未能向{pre}@{suf}发送邮件")
-                            print("向邮箱api发送失败，原因：", response["data"]["errMsg"])
-                        else:
-                            # 记录验证码发给谁 不使用username防止被修改
-                            utils.set_captcha_session(
-                                request, username, captcha)
-                            display = succeed(f"验证码已发送至{pre}@{suf}")
-                            display["noshow"] = True
-                    except:
-                        display = wrong("邮件发送失败：超时")
-                    finally:
-                        display["alert"] = True
-                        display.setdefault("colddown", 60)
-            elif send_captcha in ["wechat"]:    # 发送企业微信消息
-                username = person.person_id.username
-                captcha = utils.get_captcha(request, username)
-                send_verify_code(username, captcha)
-                display = succeed(f"验证码已发送至企业微信")
-                display["noshow"] = True
-                display["alert"] = True
-                utils.set_captcha_session(request, username, captcha)
-                display.setdefault("colddown", 60)
+        action = request.POST.get("action", "")
+        if action in ("email", "wechat"):
+            request_form = PasswordResetRequestForm(request.POST)
+            if request_form.is_valid():
+                username = request_form.cleaned_data["username"]
+                if utils.check_password_reset_request_rate(
+                    request, username
+                ):
+                    user = User.objects.filter(username=username).first()
+                    person = None
+                    if user is not None:
+                        try:
+                            person = NaturalPerson.objects.get_by_user(user)
+                        except NaturalPerson.DoesNotExist:
+                            pass
+                    if person is not None:
+                        if action == "email" and person.email:
+                            token = utils.create_password_reset_token(
+                                request, user)
+                            msg = (
+                                f"<h3><b>亲爱的{person.name}同学：</b></h3><br/>"
+                                "您好！本次密码重置凭证为：<br/>"
+                                f'<p style="color:orange">{token}</p>'
+                                "凭证十分钟内有效，且只能使用一次。<br/>"
+                                "<br/>元培学院开发组<br/>"
+                                + datetime.now().strftime("%Y年%m月%d日")
+                            )
+                            post_data = json.dumps({
+                                "sender": "元培学院开发组",
+                                "toaddrs": [person.email],
+                                "subject": "YPPF密码重置",
+                                "content": msg,
+                                "html": True,
+                                "private_level": 0,
+                                "secret": CONFIG.email.hasher.encode(msg),
+                            })
+                            try:
+                                requests.post(
+                                    CONFIG.email.url,
+                                    post_data,
+                                    timeout=6,
+                                )
+                            except requests.RequestException:
+                                pass
+                        elif action == "wechat":
+                            token = utils.create_password_reset_token(
+                                request, user)
+                            try:
+                                send_password_reset_token(
+                                    user.username, token)
+                            except Exception:
+                                pass
+            display = succeed(
+                "若账号及联系方式有效，重置凭证将发送至已绑定渠道")
+            display.update(alert=True, noshow=True, colddown=60)
+        elif action == "reset":
+            reset_form = PasswordResetForm(request.POST)
+            username = request.POST.get("username", "")
+            token = request.POST.get("token", "")
+            if reset_form.is_valid():
+                if utils.reset_password_from_token(
+                    request,
+                    reset_form.cleaned_data["username"],
+                    reset_form.cleaned_data["token"],
+                    reset_form.cleaned_data["new_password"],
+                ):
+                    return redirect(reverse("index") + "?modinfo=success")
+                display = wrong("重置凭证无效或已失效")
             else:
-                captcha, expired, old = utils.get_captcha(
-                    request, username, more_info=True)
-                if not old:
-                    display = wrong("请先发送验证码")
-                elif expired:
-                    display = wrong("验证码已过期，请重新发送")
-                elif str(vertify_code).upper() == captcha.upper():
-                    auth.login(request, user)
-                    update_related_account_in_session(
-                        request, user.username)
-                    utils.clear_captcha_session(request)
-                    # request.session["username"] = username 已废弃
-                    request.session["forgetpw"] = "yes"
-                    return redirect(reverse("modpw"))
-                else:
-                    display = wrong("验证码错误")
-                display.setdefault("colddown", 30)
-    return render(request, "forget_password.html", locals())
+                error = next(iter(reset_form.errors.values()))[0]
+                display = wrong(str(error))
+        else:
+            display = wrong("重置凭证无效或已失效")
+
+    context = {
+        "display": display,
+        "username": username,
+    }
+    return render(request, "forget_password.html", context)
 
 
 @login_required(redirect_field_name="origin")

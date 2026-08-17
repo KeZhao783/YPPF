@@ -20,6 +20,7 @@ from utils.http.utils import build_full_url
 
 __all__ = [
     'send_wechat',
+    'send_password_reset_token',
     'send_verify_code',
     'invite_to_wechat',
 ]
@@ -212,6 +213,25 @@ def send_verify_code(stu_id: str | int, captcha: str, url: str | None = '/forget
     send_wechat([stu_id], 'YPPF登录验证', message,
                 card=True, url=url, btntxt=btntxt,
                 task_id=f'wechat_verify: {stu_id}')
+
+
+def send_password_reset_token(stu_id: str | int, token: str):
+    time = datetime.now().strftime('%m月%d日 %H:%M:%S')
+    message = (
+        "您的账号正在重置密码\n本次请求的重置凭证为："
+        f"<div class=\"highlight\">{token}</div>"
+        "凭证十分钟内有效，且只能使用一次。\n"
+        f"发送时间：{time}"
+    )
+    send_wechat(
+        [stu_id],
+        'YPPF密码重置',
+        message,
+        card=True,
+        url='/forgetpw/',
+        btntxt='重置密码',
+        multithread=False,
+    )
 
 
 def _invite_to_wechat(stu_id: str, retry_times: int = 1):
