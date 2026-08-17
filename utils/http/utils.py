@@ -1,9 +1,14 @@
 from urllib import parse
 from typing import cast
 
+from django.utils.http import url_has_allowed_host_and_scheme
+
 from utils.http import HttpRequest
 
 from boot.config import GLOBAL_CONFIG
+
+
+__all__ = ["get_ip", "build_full_url", "safe_local_redirect_target"]
 
 
 def get_ip(request: HttpRequest) -> str | None:
@@ -26,3 +31,27 @@ def build_full_url(path: str, root: str | None = None) -> str:
     if not path:
         return root
     return parse.urljoin(root.rstrip('/') + '/', path)
+
+
+def safe_local_redirect_target(
+    request: HttpRequest,
+    target: str | None,
+    fallback: str,
+) -> str:
+    """Validate caller-supplied target; return trusted fallback unchanged."""
+    if not isinstance(target, str):
+        return fallback
+    target = target.strip()
+    if not target or target.startswith("//") or "\\" in target:
+        return fallback
+    if not target.startswith("/"):
+        scheme = parse.urlsplit(target).scheme.lower()
+        if scheme not in {"http", "https"}:
+            return fallback
+    if not url_has_allowed_host_and_scheme(
+        target,
+        allowed_hosts={request.get_host()},
+        require_https=request.is_secure(),
+    ):
+        return fallback
+    return target

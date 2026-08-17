@@ -11,6 +11,7 @@ from django.contrib.auth.password_validation import CommonPasswordValidator, Num
 from django.core.exceptions import ValidationError
 
 from utils.config.cast import str_to_time
+from utils.http.utils import safe_local_redirect_target
 from utils.marker import deprecated
 from app.views_dependency import *
 from app.models import (
@@ -81,11 +82,10 @@ def shiftAccount(request: HttpRequest):
     update_related_account_in_session(
         request, username, shift=True, oname=oname)
 
-    if request.method == "GET" and request.GET.get("origin"):
-        arg_url = request.GET["origin"]
-        if arg_url.startswith('/'):  # 暂时只允许内部链接
-            return redirect(arg_url)
-    return redirect("/welcome/")
+    origin = safe_local_redirect_target(
+        request, request.GET.get("origin"), "/welcome/"
+    )
+    return redirect(origin)
 
 
 @login_required(redirect_field_name="origin")
