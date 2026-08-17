@@ -18,7 +18,6 @@ Have to restrict backtrace level.
 """
 
 import os
-import json
 import logging
 from typing import Callable, Any, cast, ParamSpec, Concatenate, TypeVar
 
@@ -111,11 +110,6 @@ class Logger(logging.Logger):
             msgs.append('User: ' + request.user.__str__())  # Traceable Call
         if request.method is not None:
             msgs.append('Method: ' + request.method)
-            if request.method.lower() == 'POST':
-                try:
-                    msgs.append('Data: ' + json.dumps(request.POST.dict()))
-                except:
-                    msgs.append('Failed to jsonify post data.')
         return msgs
 
     def on_exception(self, message: str = '', *,
