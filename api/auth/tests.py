@@ -1,13 +1,34 @@
 import hashlib
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
+from threading import Barrier
 from unittest.mock import patch
 
 from django.core import signing
-from django.test import TestCase
+from django.db import close_old_connections
+from django.test import TestCase, TransactionTestCase
+from rest_framework.test import APIClient
 
+from app.models import NaturalPerson
 from api.auth.binding import BINDING_SIGNING_SALT, issue_binding_credential
 from api.config import CONFIG
-from generic.models import PendingWechatBinding
+from generic.models import (
+    PendingWechatBinding,
+    User,
+    UserWechatProfile,
+)
+
+
+def concurrent_bind(barrier, payload):
+    close_old_connections()
+    try:
+        client = APIClient()
+        barrier.wait()
+        return client.post(
+            "/api/v2/auth/wx/bind/", payload, format="json"
+        ).status_code
+    finally:
+        close_old_connections()
 
 
 class WechatBindingIssuanceTestCase(TestCase):
@@ -68,3 +89,145 @@ class WechatBindingIssuanceTestCase(TestCase):
             with self.assertRaisesRegex(RuntimeError, "create failed"):
                 issue_binding_credential("openid-v18")
         self.assertTrue(PendingWechatBinding.objects.filter(pk=expired.pk).exists())
+
+
+class WechatBindingApiTestCase(TestCase):
+    def setUp(self):
+        self.password = "valid-v18-password"
+        self.user = User.objects.create_user(
+            "v18-user", "V18 User", User.Type.PERSON,
+            password=self.password, is_newuser=False,
+        )
+        NaturalPerson.objects.create(self.user, name="V18 User")
+
+    def issue(self, openid="openid-v18"):
+        with patch(
+            "api.auth.views._fetch_openid_from_wechat",
+            return_value=(openid, None),
+        ):
+            response = self.client.post(
+                "/api/v2/auth/wx/login/", {"code": "fresh-code"}
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "unbound")
+        return response.json()["signed_openid"]
+
+    def bind(self, credential, username=None, password=None):
+        return self.client.post("/api/v2/auth/wx/bind/", {
+            "signed_openid": credential,
+            "username": username or self.user.username,
+            "password": password or self.password,
+        })
+
+    def test_forged_credential_is_rejected(self):
+        self.assertEqual(self.bind("forged").status_code, 400)
+
+    def test_expired_database_credential_is_deleted_and_rejected(self):
+        credential = self.issue()
+        fixed_now = datetime(2100, 1, 1, 12, 0)
+        PendingWechatBinding.objects.update(
+            expires_at=fixed_now - timedelta(seconds=1)
+        )
+        with patch("api.auth.binding.datetime") as mocked_datetime:
+            mocked_datetime.now.return_value = fixed_now
+            response = self.bind(credential)
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(PendingWechatBinding.objects.exists())
+
+    def test_success_consumes_credential_and_replay_fails(self):
+        credential = self.issue()
+        first = self.bind(credential)
+        second = self.bind(credential)
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 400)
+        self.assertFalse(PendingWechatBinding.objects.exists())
+        self.assertEqual(UserWechatProfile.objects.get().openid, "openid-v18")
+
+    def test_five_failed_passwords_exhaust_credential(self):
+        credential = self.issue()
+        for attempt in range(5):
+            response = self.bind(credential, password="wrong-password")
+            self.assertEqual(response.status_code, 401, attempt)
+        self.assertFalse(PendingWechatBinding.objects.exists())
+        self.assertEqual(self.bind(credential).status_code, 400)
+        self.assertFalse(UserWechatProfile.objects.exists())
+
+    def test_existing_profile_is_not_rebound(self):
+        UserWechatProfile.objects.create(
+            user=self.user,
+            openid="existing-openid",
+        )
+        credential = self.issue("new-openid")
+        self.assertEqual(self.bind(credential).status_code, 400)
+        self.assertEqual(self.user.wx_profile.openid, "existing-openid")
+
+
+class WechatBindingConcurrencyTestCase(TransactionTestCase):
+    reset_sequences = True
+
+    def setUp(self):
+        self.password = "valid-v18-password"
+        self.user = User.objects.create_user(
+            "v18-race-a", "V18 Race A", User.Type.PERSON,
+            password=self.password, is_newuser=False,
+        )
+        NaturalPerson.objects.create(self.user, name="V18 Race A")
+        self.other_user = User.objects.create_user(
+            "v18-race-b", "V18 Race B", User.Type.PERSON,
+            password=self.password, is_newuser=False,
+        )
+        NaturalPerson.objects.create(self.other_user, name="V18 Race B")
+
+    def issue(self, openid):
+        with patch(
+            "api.auth.views._fetch_openid_from_wechat",
+            return_value=(openid, None),
+        ):
+            response = APIClient().post(
+                "/api/v2/auth/wx/login/",
+                {"code": "fresh-code"},
+                format="json",
+            )
+        self.assertEqual(response.status_code, 200)
+        return response.json()["signed_openid"]
+
+    def run_race(self, credential, usernames):
+        barrier = Barrier(2)
+        payloads = [
+            {
+                "signed_openid": credential,
+                "username": username,
+                "password": self.password,
+            }
+            for username in usernames
+        ]
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [
+                executor.submit(concurrent_bind, barrier, payload)
+                for payload in payloads
+            ]
+        return [future.result() for future in futures]
+
+    def assert_single_winner(self, statuses, openid):
+        self.assertEqual(statuses.count(200), 1)
+        self.assertNotIn(500, statuses)
+        self.assertEqual(
+            UserWechatProfile.objects.filter(openid=openid).count(), 1
+        )
+        self.assertFalse(PendingWechatBinding.objects.exists())
+
+    def test_same_user_same_credential_has_one_winner(self):
+        openid = "openid-v18-race-same"
+        credential = self.issue(openid)
+        statuses = self.run_race(
+            credential, [self.user.username, self.user.username]
+        )
+        self.assert_single_winner(statuses, openid)
+
+    def test_different_users_same_credential_have_one_winner(self):
+        openid = "openid-v18-race-different"
+        credential = self.issue(openid)
+        statuses = self.run_race(
+            credential, [self.user.username, self.other_user.username]
+        )
+        self.assert_single_winner(statuses, openid)

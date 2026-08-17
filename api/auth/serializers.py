@@ -23,5 +23,6 @@ class WxBindSerializer(serializers.Serializer):
 
     username = serializers.CharField(max_length=150, help_text="Django username")
     password = serializers.CharField(max_length=128, help_text="Account password")
-    signed_openid = serializers.CharField(help_text="Signed openid issued by backend")
-
+    signed_openid = serializers.CharField(
+        help_text="One-time binding credential issued by backend"
+    )

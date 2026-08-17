@@ -65,17 +65,20 @@ from typing import Tuple
 from rest_framework_simplejwt.tokens import AccessToken
 import requests
 from django.conf import settings
-from django.contrib.auth import authenticate
-from django.core import signing
-from django.db import transaction
 from drf_spectacular.utils import extend_schema, OpenApiResponse
 from rest_framework import status
-from rest_framework.exceptions import AuthenticationFailed, ValidationError
+from rest_framework.exceptions import ValidationError
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from api.config import CONFIG
+from api.auth.binding import (
+    WechatBindingAuthenticationError,
+    WechatBindingError,
+    issue_binding_credential,
+    redeem_binding_credential,
+)
 from api.auth.serializers import WxBindSerializer, WxCodeSerializer
 from api.auth.ticket import WEBVIEW_TICKET_TTL, create_webview_ticket
 from api.authentication import WxJWTAuthentication
@@ -145,24 +148,6 @@ def _issue_jwt_for_user(user: User, account_id: str | None = None) -> str:
     token["exp"] = int(exp.timestamp())
     token["scope"] = "wx_miniapp"
     return str(token)
-
-
-def _sign_openid(openid: str) -> str:
-    """
-    Issue a signed token that encodes the openid and expires quickly.
-    """
-    signer = signing.TimestampSigner(salt="wx_miniapp_openid")
-    return signer.sign(openid)
-
-
-def _unsign_openid(signed_openid: str) -> str:
-    """
-    Validate and extract the openid from a signed token.
-    """
-    signer = signing.TimestampSigner(salt="wx_miniapp_openid")
-    return signer.unsign(
-        signed_openid, max_age=CONFIG.signed_openid_ttl_minutes * 60
-    )
 
 
 def _get_account_id(user: User) -> str | None:
@@ -339,7 +324,7 @@ class WxCodeLoginView(APIView):
                 )
 
         # 未绑定微信账号，返回临时 signed_openid 用于后续绑定
-        signed_openid = _sign_openid(openid)
+        signed_openid = issue_binding_credential(openid)
 
         return Response(
             {
@@ -384,41 +369,19 @@ class WxBindView(APIView):
         serializer = WxBindSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        # print("Received", serializer.validated_data["signed_openid"])
-
         try:
-            openid = _unsign_openid(serializer.validated_data["signed_openid"])
-        except signing.SignatureExpired as exc:
-            raise ValidationError({"signed_openid": "签名已过期，请重新登录微信授权"}) from exc
-        except signing.BadSignature as exc:
-            raise ValidationError({"signed_openid": "无效的签名，请重新登录微信授权"}) from exc
-
-        username = serializer.validated_data["username"]
-        password = serializer.validated_data["password"]
-        user = authenticate(username=username, password=password)
-
-        if user is None:
-            raise AuthenticationFailed("账号或密码错误")
-        if user.is_org():
-            raise ValidationError({"username": "请使用小组管理员的个人账户绑定"})
-        if not user.is_person():
-            raise ValidationError({"username": "该类型账户暂时不支持微信小程序"})
-
-        with transaction.atomic():
-            if (
-                UserWechatProfile.objects.select_for_update()
-                .filter(openid=openid)
-                .exclude(user=user)
-                .exists()
-            ):
-                raise ValidationError({"signed_openid": "该微信已绑定其他账号"})
-
-            profile, created = UserWechatProfile.objects.select_for_update().get_or_create(
-                user=user, defaults={"openid": openid}
+            user = redeem_binding_credential(
+                signed_openid=serializer.validated_data["signed_openid"],
+                username=serializer.validated_data["username"],
+                password=serializer.validated_data["password"],
             )
-            if not created and profile.openid != openid:
-                profile.openid = openid
-                profile.save(update_fields=["openid"])
+        except WechatBindingAuthenticationError as exc:
+            return Response(
+                {"detail": str(exc)},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+        except WechatBindingError as exc:
+            raise ValidationError({exc.field: str(exc)}) from exc
 
         account_id = _get_account_id(user)
         token = _issue_jwt_for_user(user, account_id=account_id)
@@ -429,7 +392,7 @@ class WxBindView(APIView):
                 "token_type": "Bearer",
                 "username": user.username,
                 "account_id": account_id,
-                "expires_in": CONFIG.token_expire_minutes * 60, # in seconds
+                "expires_in": CONFIG.token_expire_minutes * 60,  # in seconds
             }
         )
 
