@@ -17,9 +17,7 @@ class WxCodeSerializer(serializers.Serializer):
 
 
 class WxBindSerializer(serializers.Serializer):
-    """
-    Validate credentials and the signed openid returned by the code login step.
-    """
+    """Validate credentials and an opaque one-time binding nonce."""
 
     username = serializers.CharField(max_length=150, help_text="Django username")
     password = serializers.CharField(max_length=128, help_text="Account password")

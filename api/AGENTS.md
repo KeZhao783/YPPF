@@ -57,14 +57,16 @@ interchangeable:
 
 | Credential | Purpose | Issued by | Lifetime and storage | Transport |
 | --- | --- | --- | --- | --- |
-| `signed_openid` | Proves the WeChat identity only during first-time account binding. It is not an API login credential. | `_sign_openid()` after an unbound `wx.login` exchange. | `signed_openid_ttl_minutes` (10 minutes by default). Signed with Django's `TimestampSigner`; it is short-lived but not consumed on use. | JSON body of `POST /api/v2/auth/wx/bind/`. |
+| `signed_openid` | Proves the WeChat identity only during first-time account binding. It is not an API login credential. | `issue_binding_credential()` in `api/auth/binding.py` after an unbound `wx.login` exchange. | `signed_openid_ttl_minutes` (10 minutes by default). Its signed random nonce is returned only to the client; `PendingWechatBinding` stores the digest, openid, database expiry, and failed-attempt count. Redemption locks and consumes the pending row after success or attempt exhaustion, so replay is rejected. | JSON body of `POST /api/v2/auth/wx/bind/`. |
 | JWT access token | Authenticates normal mini-program API requests and identifies the currently selected person or organization account. | `_issue_jwt_for_user()` after login or binding. | `token_expire_minutes` (120 minutes by default). The client stores it and obtains a new token by logging in again; there is currently no refresh-token endpoint. | `Authorization: Bearer <token>`. Never place it in a URL. |
 | WebView ticket | Converts an authenticated mini-program identity into a Django session for a website WebView without exposing the JWT in the URL. | `POST /api/v2/auth/ticket/`, which requires a valid JWT. | `ticket_ttl_seconds` (60 seconds by default). Stored in Django cache and deleted when consumed. | Query parameter to `/redirect/?ticket=<ticket>&to=<path>`. |
 
 The relevant implementation is split across `api/auth/views.py` (flows and
-token issuance), `api/auth/ticket.py` (ticket creation/consumption),
-`api/authentication.py` (DRF authenticators), `generic/models.py`
-(`UserWechatProfile`), and `generic/views.py` (the WebView redirect bridge).
+JWT issuance), `api/auth/binding.py` (digest-only pending credential issuance
+and atomic one-time redemption), `api/auth/ticket.py` (ticket
+creation/consumption), `api/authentication.py` (DRF authenticators),
+`generic/models.py` (`UserWechatProfile` and `PendingWechatBinding`), and
+`generic/views.py` (the WebView redirect bridge).
 
 ### First-time binding
 

@@ -20,6 +20,7 @@ __all__ = [
 ]
 
 BINDING_SIGNING_SALT = "wx_miniapp_binding_nonce"
+_EXPIRED_BINDING_CLEANUP_BATCH_SIZE = 100
 
 
 class WechatBindingError(Exception):
@@ -61,7 +62,25 @@ def issue_binding_credential(openid: str) -> str:
     nonce = secrets.token_urlsafe(32)
     expires_at = now + timedelta(minutes=CONFIG.signed_openid_ttl_minutes)
     with transaction.atomic():
-        PendingWechatBinding.objects.filter(expires_at__lte=now).delete()
+        expired_nonce_digests = list(
+            PendingWechatBinding.objects.filter(expires_at__lte=now)
+            .order_by("nonce_digest")
+            .values_list("nonce_digest", flat=True)[
+                :_EXPIRED_BINDING_CLEANUP_BATCH_SIZE
+            ]
+        )
+        # Redeemers lock by nonce_digest; cleanup uses the same lock order.
+        for nonce_digest in expired_nonce_digests:
+            try:
+                expired = (
+                    PendingWechatBinding.objects.select_for_update().get(
+                        nonce_digest=nonce_digest
+                    )
+                )
+            except PendingWechatBinding.DoesNotExist:
+                continue
+            if expired.expires_at <= now:
+                expired.delete()
         PendingWechatBinding.objects.create(
             nonce_digest=_nonce_digest(nonce),
             openid=openid,

@@ -379,6 +379,10 @@ class WxBindView(APIView):
                         "token": {"type": "string", "description": "JWT token"},
                         "token_type": {"type": "string", "description": "Bearer"},
                         "username": {"type": "string", "description": "用户名"},
+                        "account_id": {
+                            "type": "string",
+                            "description": "主账号 username",
+                        },
                         "expires_in": {"type": "integer", "description": "token过期时间（秒)"},
                     },
                 },
