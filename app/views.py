@@ -1507,14 +1507,20 @@ def forgetPassword(request: HttpRequest):
             username = request.POST.get("username", "")
             token = request.POST.get("token", "")
             if reset_form.is_valid():
-                if utils.reset_password_from_token(
-                    request,
-                    reset_form.cleaned_data["username"],
-                    reset_form.cleaned_data["token"],
-                    reset_form.cleaned_data["new_password"],
-                ):
-                    return redirect(reverse("index") + "?modinfo=success")
-                display = wrong("重置凭证无效或已失效")
+                try:
+                    reset_succeeded = utils.reset_password_from_token(
+                        request,
+                        reset_form.cleaned_data["username"],
+                        reset_form.cleaned_data["token"],
+                        reset_form.cleaned_data["new_password"],
+                    )
+                except ValidationError as error:
+                    display = wrong(error.messages[0])
+                else:
+                    if reset_succeeded:
+                        return redirect(
+                            reverse("index") + "?modinfo=success")
+                    display = wrong("重置凭证无效或已失效")
             else:
                 error = next(iter(reset_form.errors.values()))[0]
                 display = wrong(str(error))

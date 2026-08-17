@@ -559,6 +559,52 @@ class ForgetPasswordViewTests(TestCase):
             password="Secure-pass-123",
         ))
 
+    def test_reset_rejects_password_matching_target_username(self):
+        _, token = self.send_email_token()
+
+        rejected = self.client.post(reverse("forgetpw"), {
+            "action": "reset",
+            "username": self.user.username,
+            "token": token,
+            "new_password": self.user.username,
+            "confirm_password": self.user.username,
+        })
+
+        self.assertEqual(rejected.status_code, 200)
+        self.user.refresh_from_db()
+        self.assertTrue(self.user.check_password("old-password"))
+        self.assertIsNone(
+            models.PasswordResetChallenge.objects.get(
+                user=self.user).consumed_at)
+
+        accepted = self.client.post(reverse("forgetpw"), {
+            "action": "reset",
+            "username": self.user.username,
+            "token": token,
+            "new_password": "Secure-pass-123",
+            "confirm_password": "Secure-pass-123",
+        })
+        self.assertRedirects(
+            accepted, reverse("index") + "?modinfo=success")
+
+    def test_reset_preserves_password_whitespace(self):
+        _, token = self.send_email_token()
+        password = " Secure-pass-123 "
+
+        response = self.client.post(reverse("forgetpw"), {
+            "action": "reset",
+            "username": self.user.username,
+            "token": token,
+            "new_password": password,
+            "confirm_password": password,
+        })
+
+        self.assertRedirects(
+            response, reverse("index") + "?modinfo=success")
+        self.user.refresh_from_db()
+        self.assertTrue(self.user.check_password(password))
+        self.assertFalse(self.user.check_password(password.strip()))
+
 
 class PasswordResetDeliveryTests(TestCase):
     @patch("extern.wechat.send_wechat")

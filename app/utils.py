@@ -10,6 +10,7 @@ from typing import cast, overload, Literal
 import xlwt
 import imghdr
 from django.contrib import auth
+from django.contrib.auth.password_validation import validate_password
 from django.core import signing
 from django.db.models import Q
 from django.shortcuts import redirect
@@ -318,6 +319,7 @@ def reset_password_from_token(
                 _lock_password_reset_limits(challenge_identifiers, now)
             return False
 
+        validate_password(new_password, user)
         user.set_password(new_password)
         user.save(update_fields=['password'])
         challenge.consumed_at = now
