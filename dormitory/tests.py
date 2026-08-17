@@ -41,6 +41,67 @@ class CreateDormitoryQuestionnaire2026Tests(TestCase):
 
 
 class DormitoryRoutineQAValidationTests(TestCase):
+    def assert_submission_rejection_preserves_input(
+        self,
+        *,
+        survey_status,
+        start_time,
+        end_time,
+        expected_warning,
+    ):
+        creator = User.objects.create_user(
+            username="dormitory_rejection_creator",
+            name="Dormitory Rejection Creator",
+        )
+        student = User.objects.create_user(
+            username="dormitory_rejection_student",
+            name="Dormitory Rejection Student",
+        )
+        survey = Survey.objects.create(
+            title="Dormitory rejected survey",
+            creator=creator,
+            status=survey_status,
+            start_time=start_time,
+            end_time=end_time,
+        )
+        question = Question.objects.create(
+            survey=survey,
+            order=1,
+            topic="Required text",
+            type=Question.Type.TEXT,
+            required=True,
+        )
+        submitted_value = "preserve this response"
+
+        view = DormitoryRoutineQAView()
+        view.request = RequestFactory().post(
+            "/dormitory/routine-QA/",
+            {"1": submitted_value},
+        )
+        view.request.user = student
+        view.get_survey = lambda: survey
+        response = object()
+        rendered = {}
+
+        def capture_render(**kwargs):
+            rendered.update(kwargs)
+            return response
+
+        view.render = capture_render
+
+        self.assertIs(view.post(), response)
+        self.assertEqual(
+            rendered["html_display"],
+            {"warn_code": 1, "warn_message": expected_warning},
+        )
+        rendered_question, _, rendered_value = rendered["survey_iter"][0]
+        self.assertEqual(rendered_question, question)
+        self.assertEqual(rendered_value, submitted_value)
+        self.assertFalse(
+            AnswerSheet.objects.filter(survey=survey, creator=student).exists()
+        )
+        self.assertFalse(AnswerText.objects.filter(question=question).exists())
+
     def test_invalid_choice_is_rejected_before_answer_sheet_creation(self):
         user = User.objects.create_user(username="student", name="Student")
         survey = Survey.objects.create(
@@ -122,6 +183,24 @@ class DormitoryRoutineQAValidationTests(TestCase):
         self.assertEqual(
             [row["id"] for row in result_response.data],
             [sheet.pk],
+        )
+
+    def test_unpublished_survey_rejection_preserves_entered_values(self):
+        now = datetime.now()
+        self.assert_submission_rejection_preserves_input(
+            survey_status=Survey.Status.ENDED,
+            start_time=now - timedelta(days=1),
+            end_time=now + timedelta(days=1),
+            expected_warning="只能提交已发布的问卷！",
+        )
+
+    def test_expired_survey_rejection_preserves_entered_values(self):
+        now = datetime.now()
+        self.assert_submission_rejection_preserves_input(
+            survey_status=Survey.Status.PUBLISHED,
+            start_time=now - timedelta(days=2),
+            end_time=now - timedelta(days=1),
+            expected_warning="当前不在问卷提交时间内！",
         )
 
 class DormitoryMajorPreferenceScoringTests(TestCase):

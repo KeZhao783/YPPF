@@ -1,5 +1,6 @@
 from django.db import transaction
 from rest_framework import viewsets
+from rest_framework.exceptions import ValidationError as DRFValidationError
 
 # TODO: Leaky dependency
 from utils.marker import fix_me
@@ -152,17 +153,27 @@ class DormitoryRoutineQAView(ProfileTemplateView):
                     **render_kwargs,
                 )
 
-        with transaction.atomic():
-            sheet = AnswerSheet.objects.create(creator=self.request.user,
-                                               survey=survey)
-            for question in survey.questions.order_by('order'):
-                answer = submitted[str(question.order)]
-                if not answer:
-                    continue
-                AnswerText.objects.create(question=question,
-                                          answersheet=sheet,
-                                          body=answer)
-            submit_answersheet(sheet.pk, self.request.user)
+        try:
+            with transaction.atomic():
+                sheet = AnswerSheet.objects.create(creator=self.request.user,
+                                                   survey=survey)
+                for question in survey.questions.order_by('order'):
+                    answer = submitted[str(question.order)]
+                    if not answer:
+                        continue
+                    AnswerText.objects.create(question=question,
+                                              answersheet=sheet,
+                                              body=answer)
+                submit_answersheet(sheet.pk, self.request.user)
+        except DRFValidationError as exc:
+            message = exc.detail[0] if exc.detail else '问卷提交失败，请稍后重试。'
+            return self.render(
+                html_display=dict(
+                    warn_code=1,
+                    warn_message=str(message),
+                ),
+                **render_kwargs,
+            )
         return self.render(submitted=True)
 
 
