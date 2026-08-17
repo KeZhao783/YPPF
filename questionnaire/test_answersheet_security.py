@@ -907,6 +907,15 @@ class AnswerSheetConcurrencyTests(TransactionTestCase):
             and "QUESTIONNAIRE_ANSWERSHEET" in normalized
         )
 
+    @staticmethod
+    def _is_unlocked_sheet_read(sql):
+        normalized = " ".join(sql.upper().split())
+        return (
+            normalized.startswith("SELECT")
+            and "QUESTIONNAIRE_ANSWERSHEET" in normalized
+            and "FOR UPDATE" not in normalized
+        )
+
     def _race_submit_against_mutation(self, method, path, data=None):
         submit_has_lock = Event()
         allow_submit = Event()
@@ -1056,3 +1065,69 @@ class AnswerSheetConcurrencyTests(TransactionTestCase):
             AnswerText.objects.filter(pk=self.required_answer.pk).exists())
         self.sheet.refresh_from_db()
         self.assertEqual(self.sheet.status, AnswerSheet.Status.SUBMITTED)
+
+    def test_sheet_delete_wins_race_against_submit(self):
+        submit_read_sheet = Event()
+        allow_submit_to_lock = Event()
+        submit_paused = {"value": False}
+        results = {}
+        errors = []
+
+        def pause_submit_after_initial_read(execute, sql, params, many, context):
+            result = execute(sql, params, many, context)
+            if (
+                not submit_paused["value"]
+                and self._is_unlocked_sheet_read(sql)
+            ):
+                submit_paused["value"] = True
+                submit_read_sheet.set()
+                if not allow_submit_to_lock.wait(10):
+                    raise TimeoutError("submit read was not released by test")
+            return result
+
+        def submit_worker():
+            close_old_connections()
+            client = APIClient()
+            client.force_authenticate(user=self.respondent)
+            try:
+                with connection.execute_wrapper(pause_submit_after_initial_read):
+                    response = client.post(
+                        reverse("answersheet-submit", args=[self.sheet.pk]),
+                        {},
+                        format="json",
+                    )
+                results["submit"] = response.status_code
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                close_old_connections()
+
+        submit_thread = Thread(target=submit_worker)
+        submit_thread.start()
+        delete_response = None
+        try:
+            self.assertTrue(
+                submit_read_sheet.wait(10),
+                "submit did not perform its initial unlocked sheet read",
+            )
+            client = APIClient()
+            client.force_authenticate(user=self.respondent)
+            delete_response = client.delete(
+                reverse("answersheet-detail", args=[self.sheet.pk]),
+            )
+        finally:
+            allow_submit_to_lock.set()
+            submit_thread.join(10)
+
+        self.assertFalse(submit_thread.is_alive(), "submit thread did not finish")
+        if errors:
+            raise errors[0]
+        self.assertIsNotNone(delete_response)
+        self.assertEqual(
+            delete_response.status_code,
+            status.HTTP_204_NO_CONTENT,
+        )
+        self.assertEqual(results["submit"], status.HTTP_404_NOT_FOUND)
+        self.assertFalse(AnswerSheet.objects.filter(pk=self.sheet.pk).exists())
+        self.assertFalse(
+            AnswerText.objects.filter(pk=self.required_answer.pk).exists())

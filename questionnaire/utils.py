@@ -3,7 +3,7 @@ from datetime import datetime
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import transaction
 from rest_framework import serializers
-from rest_framework.exceptions import PermissionDenied
+from rest_framework.exceptions import NotFound, PermissionDenied
 
 from questionnaire.models import AnswerSheet, AnswerText, Survey
 from questionnaire.validators import validate_answer_body
@@ -27,12 +27,15 @@ def lock_draft_answersheet(sheet_id, actor):
 def submit_answersheet(sheet_id, actor, now=None):
     now = datetime.now() if now is None else now
     with transaction.atomic():
-        sheet = (
-            AnswerSheet.objects
-            .select_for_update()
-            .select_related('survey')
-            .get(pk=sheet_id)
-        )
+        try:
+            sheet = (
+                AnswerSheet.objects
+                .select_for_update()
+                .select_related('survey')
+                .get(pk=sheet_id)
+            )
+        except AnswerSheet.DoesNotExist as exc:
+            raise NotFound("答卷不存在或已被删除！") from exc
         if sheet.creator_id != actor.pk:
             raise PermissionDenied("只有答卷创建者才能提交答卷！")
         if sheet.status != AnswerSheet.Status.DRAFT:
