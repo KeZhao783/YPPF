@@ -6,7 +6,9 @@ from unittest.mock import patch
 
 from django.core import signing
 from django.db import close_old_connections
-from django.test import TestCase, TransactionTestCase
+from django.test import TestCase, TransactionTestCase, override_settings
+from django.urls import include, path
+from drf_spectacular.views import SpectacularAPIView
 from rest_framework.test import APIClient
 
 from app.models import NaturalPerson
@@ -19,6 +21,12 @@ from generic.models import (
 )
 
 
+urlpatterns = [
+    path("api/", include("api.urls")),
+    path("api/schema/", SpectacularAPIView.as_view(), name="schema"),
+]
+
+
 def concurrent_bind(barrier, payload):
     close_old_connections()
     try:
@@ -29,6 +37,15 @@ def concurrent_bind(barrier, payload):
         ).status_code
     finally:
         close_old_connections()
+
+
+@override_settings(ROOT_URLCONF="api.auth.tests")
+class WechatBindingSchemaTestCase(TestCase):
+    def test_schema_describes_one_time_binding_credential(self):
+        response = self.client.get("/api/schema/")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b"one-time", response.content)
+        self.assertIn(b"signed_openid", response.content)
 
 
 class WechatBindingIssuanceTestCase(TestCase):

@@ -74,19 +74,25 @@ token issuance), `api/auth/ticket.py` (ticket creation/consumption),
    WeChat `jscode2session` endpoint. App ID, secret, endpoint, and TTL values
    come from `api.config.CONFIG`; they must not be hard-coded.
 3. If no `UserWechatProfile` has that `openid`, the response has
-   `status="unbound"` and a short-lived `signed_openid`. This signed value is
-   tamper-evident and time-limited, but it is only a handoff between login and
-   binding; do not accept it as authentication for another endpoint.
+   `status="unbound"` and a short-lived `signed_openid`. Its bearer value is a
+   signed random nonce, not an openid. The database stores only its digest,
+   openid, expiry, and failed-attempt count; it is a one-time handoff between
+   login and binding, never authentication for another endpoint.
 4. The client sends `signed_openid`, the YPPF `username`, and `password` to
    `POST /api/v2/auth/wx/bind/`, which is also public.
-5. The backend verifies the signature and age, authenticates the YPPF
-   credentials, and requires a personal account. Organizations must be used
-   through a personal administrator and cannot be bound directly.
-6. Inside a transaction, the backend creates or updates
-   `UserWechatProfile`. Its one-to-one `user` field and unique `openid` field
-   enforce at most one WeChat identity per user and one user per WeChat
-   identity. Binding fails if the `openid` belongs to another user.
+5. The backend verifies the signature and age, locks the pending credential
+   row, authenticates the YPPF credentials, and requires a personal account.
+   Organizations must be used through a personal administrator and cannot be
+   bound directly. The default password-attempt limit is 5.
+6. Inside the profile-creation transaction, the backend creates a
+   `UserWechatProfile` only for an unbound account and consumes the locked
+   pending row. Its one-to-one `user` field and unique `openid` field enforce
+   at most one WeChat identity per user and one user per WeChat identity.
+   Binding rejects an existing account or openid binding; it never silently
+   rebinds or updates a profile.
 7. A successful binding immediately returns the user's JWT access token.
+   Clients must restart `wx.login()` after credential expiry, replay, or
+   failed-attempt exhaustion.
 
 Never log the WeChat code, raw `openid`, `signed_openid`, password, app secret,
 JWT, or ticket. Binding changes must preserve signature expiry, database
@@ -215,7 +221,11 @@ Use the following decision rules:
   username, `account_id`, or other JWT display claim as the authorization
   decision by itself.
 - Reserve `TicketAuthentication` for the `/redirect/` WebView bridge and
-  reserve `signed_openid` for `/wx/bind/`. Neither may replace JWT
+  reserve `signed_openid` for `/wx/bind/`. `signed_openid` is a signed random
+  nonce backed by a digest-only pending row; redemption locks and consumes it
+  in the profile-creation transaction. It expires, is one-time, permits 5
+  failed password attempts by default, and requires a fresh `wx.login()` after
+  expiry, replay, or exhaustion. Neither credential may replace JWT
   authentication on feature APIs.
 
 Document the authentication requirement and 401/403 responses with

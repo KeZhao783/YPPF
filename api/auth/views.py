@@ -16,7 +16,7 @@ wx.login() → code → 后端用 code 向微信换 openid
         │ 已绑定                           │ 未绑定
         ↓                                 ↓
    main_user = profile.user           返回 signed_openid
-        ↓                              （供后续绑定用）
+        ↓                         （不透明 one-time 绑定凭据）
    ┌────┴─────────┐
    │ 无 username  │ 有 username 
    ↓              ↓
@@ -27,17 +27,19 @@ wx.login() → code → 后端用 code 向微信换 openid
               不在 → 403
 
 ## 绑定时
-signed_openid（上一步返回）+ username + password
+signed_openid（签名随机 nonce；数据库仅保存摘要）+ username + password
         ↓
-验证 signed_openid（防伪造、有时效）
+验证并锁定 signed_openid（`signed_openid_ttl_minutes` 后过期）
         ↓
 authenticate(username, password)
+        ↓
+密码失败计数达到默认 5 次，或成功使用后，凭据均失效
         ↓
 user 必须是个人账户（不能是组织）
         ↓
 检查：该 openid 是否已绑定其他用户 → 是则 400
         ↓
-创建 UserWechatProfile(user, openid)
+在同一事务中创建 UserWechatProfile(user, openid) 并消费凭据
         ↓
 返回 JWT （account id为user）
 
@@ -217,14 +219,22 @@ def _check_user_in_accounts(username: str, account_id: str) -> bool:
 class WxCodeLoginView(APIView):
     """
     Accepts the temporary code from ``wx.login`` and returns either a JWT
-    (for already-bound users) or a short-lived signed_openid for binding.
+    (for already-bound users) or an opaque one-time ``signed_openid`` binding
+    credential. The credential expires after ``signed_openid_ttl_minutes`` and
+    is invalid after successful use or the failed-password-attempt limit.
     """
 
     permission_classes = [AllowAny]
 
     @extend_schema(
         summary="微信小程序登录",
-        description="使用微信小程序 wx.login() 返回的 code 换取 openid，如果已绑定则返回 JWT，否则返回 signed_openid 用于后续绑定。可选的 username 参数用于指定登录到哪个账户（必须在可登录账户列表中）。",
+        description=(
+            "使用微信小程序 wx.login() 返回的 code 换取 openid。如果已绑定则返回 JWT；"
+            "否则返回不透明的 one-time signed_openid 绑定凭据。该凭据在 "
+            "signed_openid_ttl_minutes 后过期，成功使用或达到默认 5 次密码失败"
+            "限制后失效。可选的 username 参数用于指定登录到哪个账户（必须在可登录"
+            "账户列表中）。"
+        ),
         request=WxCodeSerializer,
         responses={
             200: OpenApiResponse(
@@ -238,7 +248,13 @@ class WxCodeLoginView(APIView):
                         "username": {"type": "string", "description": "用户名 (仅当 status=bound 时存在)"},
                         "name": {"type": "string", "description": "用户名称 (仅当 status=bound 时存在)"},
                         "account_id": {"type": "string", "description": "主账号 username (仅当 status=bound 时存在)"},
-                        "signed_openid": {"type": "string", "description": "签名的 openid (仅当 status=unbound 时存在)"},
+                        "signed_openid": {
+                            "type": "string",
+                            "description": (
+                                "签名随机 nonce 的不透明 one-time 绑定凭据"
+                                "（仅当 status=unbound 时存在）"
+                            ),
+                        },
                         "expires_in": {"type": "integer", "description": "signed_openid/token 过期时间（秒)"},
                     },
                 },
@@ -337,14 +353,21 @@ class WxCodeLoginView(APIView):
 
 class WxBindView(APIView):
     """
-    Bind an openid to a Django user using username/password and return a JWT.
+    Redeem an opaque one-time ``signed_openid`` with username/password to bind
+    its openid to a Django user and return a JWT. It expires after
+    ``signed_openid_ttl_minutes`` and is invalid after success or the
+    failed-password-attempt limit.
     """
 
     permission_classes = [AllowAny]
 
     @extend_schema(
         summary="绑定微信账号",
-        description="使用账号密码和 signed_openid 绑定微信账号，绑定成功后返回 JWT",
+        description=(
+            "使用账号密码兑换不透明的 one-time signed_openid 绑定凭据并绑定微信"
+            "账号，绑定成功后返回 JWT。凭据在 signed_openid_ttl_minutes 后过期，"
+            "成功使用或达到默认 5 次密码失败限制后失效。"
+        ),
         request=WxBindSerializer,
         responses={
             200: OpenApiResponse(
@@ -360,8 +383,8 @@ class WxBindView(APIView):
                     },
                 },
             ),
-            400: OpenApiResponse(description="请求错误，如 signed_openid 无效或已过期"),
-            401: OpenApiResponse(description="认证失败，账号或密码错误"),
+            400: OpenApiResponse(description="请求错误，如 signed_openid 无效、已使用、已过期或已耗尽"),
+            401: OpenApiResponse(description="认证失败，账号或密码错误；达到默认 5 次失败后凭据失效"),
         },
         tags=["微信小程序认证"],
     )
