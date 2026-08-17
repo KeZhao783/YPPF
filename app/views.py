@@ -12,7 +12,6 @@ from django.core.exceptions import ValidationError
 
 from utils.config.cast import str_to_time
 from utils.marker import deprecated
-from utils.hasher import MyMD5Hasher
 from app.views_dependency import *
 from app.models import (
     NaturalPerson,
@@ -87,37 +86,6 @@ def shiftAccount(request: HttpRequest):
         if arg_url.startswith('/'):  # 暂时只允许内部链接
             return redirect(arg_url)
     return redirect("/welcome/")
-
-
-# Return content
-# Sname 姓名 Succeed 成功与否
-wechat_login_coder = MyMD5Hasher("wechat_login")
-
-
-@logger.secure_view()
-def miniLogin(request: HttpRequest):
-    try:
-        assert request.method == "POST"
-        username = request.POST["username"]
-        password = request.POST["password"]
-        secret_token = request.POST["secret_token"]
-        assert wechat_login_coder.verify(username, secret_token) == True
-        user = User.objects.get(username=username)
-
-        userinfo = auth.authenticate(username=username, password=password)
-
-        if userinfo:
-
-            auth.login(request, userinfo)
-
-            # request.session["username"] = username 已废弃
-            en_pw = GLOBAL_CONFIG.hasher.encode(username)
-            user_account = NaturalPerson.objects.get_by_user(username)
-            return JsonResponse({"Sname": user_account.name, "Succeed": 1}, status=200)
-        else:
-            return JsonResponse({"Sname": username, "Succeed": 0}, status=400)
-    except:
-        return JsonResponse({"Sname": "", "Succeed": 0}, status=400)
 
 
 @login_required(redirect_field_name="origin")
