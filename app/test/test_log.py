@@ -8,11 +8,16 @@ from app.log import ProfileLogger
 
 
 class ProfileLoggerRedactionTestCase(SimpleTestCase):
-    def test_secure_view_omits_post_values_from_log_and_wechat(self):
-        secrets = ["password-v13", "token-v13", "identity-v13"]
+    def test_secure_view_omits_post_and_query_values_from_alerts(self):
+        post_secrets = ["password-v13", "token-v13", "identity-v13"]
+        query_secret = "auth-v13-query-secret"
         request = RequestFactory().post(
-            "/failing-view/",
-            {"password": secrets[0], "token": secrets[1], "identity": secrets[2]},
+            f"/failing-view/?auth={query_secret}",
+            {
+                "password": post_secrets[0],
+                "token": post_secrets[1],
+                "identity": post_secrets[2],
+            },
         )
         request.user = AnonymousUser()
         logger = ProfileLogger("v13-test")
@@ -32,6 +37,7 @@ class ProfileLoggerRedactionTestCase(SimpleTestCase):
         self.assertEqual(response.status_code, 302)
         for message in (local_message, wechat_message):
             self.assertIn("URL: /failing-view/", message)
+            self.assertNotIn("auth=", message)
             self.assertIn("Method: POST", message)
-            for value in secrets:
+            for value in (*post_secrets, query_secret):
                 self.assertNotIn(value, message)

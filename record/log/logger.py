@@ -105,7 +105,7 @@ class Logger(logging.Logger):
     @classmethod
     def _request_msgs(cls, request: HttpRequest) -> list[str]:
         msgs = []
-        msgs.append('URL: ' + request.get_full_path())
+        msgs.append('URL: ' + request.path)
         if request.user.is_authenticated:
             msgs.append('User: ' + request.user.__str__())  # Traceable Call
         if request.method is not None:
