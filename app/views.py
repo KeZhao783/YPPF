@@ -9,6 +9,8 @@ from django.db import transaction
 from django.db.models import Q, F, Sum, QuerySet
 from django.contrib.auth.password_validation import CommonPasswordValidator, NumericPasswordValidator
 from django.core.exceptions import ValidationError
+from django.views.decorators.csrf import csrf_protect
+from django.views.decorators.http import require_POST
 
 from utils.config.cast import str_to_time
 from utils.http.utils import safe_local_redirect_target
@@ -66,24 +68,25 @@ from semester.api import current_semester
 
 
 
+@csrf_protect
 @login_required(redirect_field_name="origin")
+@require_POST
 @logger.secure_view()
 def shiftAccount(request: HttpRequest):
+    """Switch the current person session to an authorized related account."""
 
     username = request.session.get("NP")
     if not username:
         return redirect(message_url(wrong('没有可切换的账户信息，请重新登录!')))
 
-    oname = ""
-    if request.method == "GET" and request.GET.get("oname"):
-        oname = request.GET["oname"]
+    oname = request.POST.get("oname", "")
 
     # 不一定更新成功，但无所谓
     update_related_account_in_session(
         request, username, shift=True, oname=oname)
 
     origin = safe_local_redirect_target(
-        request, request.GET.get("origin"), "/welcome/"
+        request, request.POST.get("origin"), "/welcome/"
     )
     return redirect(origin)
 
