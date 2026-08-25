@@ -116,11 +116,11 @@ def issue_binding_credential(openid: str) -> str:
             ]
         )
         # Redeemers lock by nonce_digest; cleanup uses the same lock order.
-        for nonce_digest in expired_nonce_digests:
+        for expired_nonce_digest in expired_nonce_digests:
             try:
                 expired = (
                     PendingWechatBinding.objects.select_for_update().get(
-                        nonce_digest=nonce_digest
+                        nonce_digest=expired_nonce_digest
                     )
                 )
             except PendingWechatBinding.DoesNotExist:

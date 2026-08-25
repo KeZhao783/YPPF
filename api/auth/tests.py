@@ -341,6 +341,25 @@ class WechatBindingApiTestCase(TestCase):
         self.assertFalse(PendingWechatBinding.objects.exists())
         self.assertEqual(UserWechatProfile.objects.get().openid, "openid-v18")
 
+    def test_credential_issued_after_expired_cleanup_can_bind(self):
+        expired = PendingWechatBinding.objects.create(
+            nonce_digest="e" * 64,
+            openid="expired-openid",
+            expires_at=datetime.now() - timedelta(seconds=1),
+        )
+
+        credential = self.issue()
+        response = self.bind(credential)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(
+            PendingWechatBinding.objects.filter(pk=expired.pk).exists()
+        )
+        self.assertEqual(
+            UserWechatProfile.objects.get(user=self.user).openid,
+            "openid-v18",
+        )
+
     def test_five_failed_passwords_exhaust_credential(self):
         credential = self.issue()
         for attempt in range(5):
