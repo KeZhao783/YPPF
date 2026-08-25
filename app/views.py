@@ -47,8 +47,8 @@ from extern.wechat import (
     invite_to_wechat,
 )
 from extern.password_reset import (
-    queue_password_reset_email,
-    queue_password_reset_wechat,
+    queue_prepared_password_reset_email,
+    queue_prepared_password_reset_wechat,
 )
 from app.notification_utils import (
     notification_status_change,
@@ -1456,9 +1456,11 @@ def forgetPassword(request: HttpRequest):
             request_form = PasswordResetRequestForm(request.POST)
             if request_form.is_valid():
                 username = request_form.cleaned_data["username"]
-                if utils.check_password_reset_request_rate(
-                    request, username
-                ):
+                def prepare_delivery():
+                    if not utils.check_password_reset_request_rate(
+                        request, username
+                    ):
+                        return None
                     user = User.objects.filter(username=username).first()
                     person = None
                     if user is not None:
@@ -1470,13 +1472,17 @@ def forgetPassword(request: HttpRequest):
                         if action == "email" and person.email:
                             token = utils.create_password_reset_token(
                                 request, user)
-                            queue_password_reset_email(
-                                person.name, person.email, token)
+                            return person.name, person.email, token
                         elif action == "wechat":
                             token = utils.create_password_reset_token(
                                 request, user)
-                            queue_password_reset_wechat(
-                                user.username, token)
+                            return user.username, token
+                    return None
+
+                if action == "email":
+                    queue_prepared_password_reset_email(prepare_delivery)
+                else:
+                    queue_prepared_password_reset_wechat(prepare_delivery)
             display = succeed(
                 "若账号及联系方式有效，重置凭证将发送至已绑定渠道")
             display.update(alert=True, noshow=True, colddown=60)

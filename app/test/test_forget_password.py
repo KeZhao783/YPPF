@@ -3,6 +3,7 @@ import json
 import uuid
 from unittest.mock import Mock, patch
 
+import requests
 from django.contrib.sessions.middleware import SessionMiddleware
 from django.core import signing
 from django.test import Client, RequestFactory, TestCase
@@ -503,12 +504,21 @@ class ForgetPasswordViewTests(TestCase):
         )
 
     def send_email_token(self, username=None):
-        with patch("app.views.queue_password_reset_email") as queue:
+        prepared = {}
+
+        def queue_delivery(prepare):
+            prepared["args"] = prepare()
+            return True
+
+        with patch(
+            "app.views.queue_prepared_password_reset_email",
+            side_effect=queue_delivery,
+        ):
             response = self.client.post(reverse("forgetpw"), {
                 "action": "email",
                 "username": username or self.user.username,
             })
-        return response, queue.call_args.args[2]
+        return response, prepared["args"][2]
 
     def test_post_requires_csrf(self):
         response = Client(enforce_csrf_checks=True).post(
@@ -539,10 +549,12 @@ class ForgetPasswordViewTests(TestCase):
 
         self.assertEqual(response.status_code, 405)
 
-    @patch("app.views.queue_password_reset_email")
+    @patch("app.views.queue_prepared_password_reset_email")
     def test_existing_and_missing_accounts_get_same_delivery_message(
         self, queue: Mock,
     ):
+        prepared = []
+        queue.side_effect = lambda prepare: prepared.append(prepare()) or True
         existing = self.client.post(reverse("forgetpw"), {
             "action": "email",
             "username": self.user.username,
@@ -555,12 +567,15 @@ class ForgetPasswordViewTests(TestCase):
         message = "若账号及联系方式有效，重置凭证将发送至已绑定渠道"
         self.assertContains(existing, message)
         self.assertContains(missing, message)
-        queue.assert_called_once()
+        self.assertEqual(queue.call_count, 2)
+        self.assertIsNotNone(prepared[0])
+        self.assertIsNone(prepared[1])
 
-    @patch("app.views.queue_password_reset_email")
+    @patch("app.views.queue_prepared_password_reset_email")
     def test_fourth_account_delivery_request_creates_no_challenge(
         self, queue: Mock,
     ):
+        queue.side_effect = lambda prepare: prepare() is not None
         for _ in range(4):
             self.client.post(reverse("forgetpw"), {
                 "action": "email",
@@ -572,6 +587,49 @@ class ForgetPasswordViewTests(TestCase):
                 user=self.user).count(),
             3,
         )
+
+    def test_rejected_delivery_submission_preserves_existing_state(self):
+        _, token = self.send_email_token()
+        challenge = models.PasswordResetChallenge.objects.get(user=self.user)
+        throttle_attempts = dict(
+            models.PasswordResetThrottle.objects.values_list(
+                "scope", "attempts"))
+
+        with patch(
+            "app.views.queue_prepared_password_reset_email",
+            return_value=False,
+        ) as queue:
+            response = self.client.post(reverse("forgetpw"), {
+                "action": "email",
+                "username": self.user.username,
+            })
+
+        self.assertContains(
+            response,
+            "若账号及联系方式有效，重置凭证将发送至已绑定渠道",
+        )
+        queue.assert_called_once()
+        challenge.refresh_from_db()
+        self.assertIsNone(challenge.invalidated_at)
+        self.assertEqual(
+            models.PasswordResetChallenge.objects.filter(
+                user=self.user).count(),
+            1,
+        )
+        self.assertEqual(
+            dict(models.PasswordResetThrottle.objects.values_list(
+                "scope", "attempts")),
+            throttle_attempts,
+        )
+        reset = self.client.post(reverse("forgetpw"), {
+            "action": "reset",
+            "username": self.user.username,
+            "token": token,
+            "new_password": "Secure-pass-123",
+            "confirm_password": "Secure-pass-123",
+        })
+        self.assertRedirects(
+            reset, reverse("index") + "?modinfo=success")
 
     def test_case_variant_request_and_reset_use_the_same_account(self):
         username = self.user.username.upper()
@@ -701,9 +759,69 @@ class PasswordResetDeliveryTests(TestCase):
         )
         self.assertEqual(args[-1], token)
 
+    @patch("extern.password_reset._delivery_executor.submit")
+    @patch("extern.password_reset._delivery_slots.acquire", return_value=True)
+    def test_prepared_delivery_reserves_capacity_before_creating_token(
+        self,
+        acquire: Mock,
+        submit: Mock,
+    ):
+        token = "opaque-password-reset-token"
+        prepare = Mock(return_value=(
+            "Reset User",
+            "reset@example.com",
+            token,
+        ))
+
+        self.assertTrue(
+            password_reset.queue_prepared_password_reset_email(prepare))
+
+        prepare.assert_called_once_with()
+        delivery_runner, delivery, prepared_args = submit.call_args.args
+        self.assertIs(
+            delivery_runner,
+            password_reset._run_prepared_delivery,
+        )
+        self.assertIs(
+            delivery,
+            password_reset._deliver_password_reset_email,
+        )
+        self.assertEqual(prepared_args.result()[-1], token)
+
+    @patch("extern.password_reset._delivery_slots.acquire", return_value=False)
+    def test_full_delivery_queue_skips_token_creation(self, acquire: Mock):
+        prepare = Mock()
+
+        self.assertFalse(
+            password_reset.queue_prepared_password_reset_email(prepare))
+
+        acquire.assert_called_once_with(blocking=False)
+        prepare.assert_not_called()
+
+    @patch("extern.password_reset._delivery_slots.release")
+    @patch(
+        "extern.password_reset._delivery_executor.submit",
+        side_effect=RuntimeError,
+    )
+    @patch("extern.password_reset._delivery_slots.acquire", return_value=True)
+    def test_unavailable_delivery_executor_skips_token_creation(
+        self,
+        acquire: Mock,
+        submit: Mock,
+        release: Mock,
+    ):
+        prepare = Mock()
+
+        self.assertFalse(
+            password_reset.queue_prepared_password_reset_email(prepare))
+
+        prepare.assert_not_called()
+        release.assert_called_once_with()
+
     @patch("extern.password_reset.requests.post")
     def test_email_delivery_contains_the_opaque_token(self, post: Mock):
         token = "opaque-password-reset-token"
+        post.return_value.json.return_value = {"status": 200}
 
         password_reset._deliver_password_reset_email(
             "Reset User",
@@ -716,6 +834,32 @@ class PasswordResetDeliveryTests(TestCase):
         self.assertEqual(post_data["toaddrs"], ["reset@example.com"])
         self.assertIn(token, post_data["content"])
         self.assertEqual(post.call_args.kwargs["timeout"], 6)
+        post.return_value.raise_for_status.assert_called_once_with()
+
+    @patch("extern.password_reset.requests.post")
+    def test_email_delivery_rejects_http_errors(self, post: Mock):
+        post.return_value.raise_for_status.side_effect = requests.HTTPError
+
+        with self.assertRaises(requests.HTTPError):
+            password_reset._deliver_password_reset_email(
+                "Reset User",
+                "reset@example.com",
+                "opaque-password-reset-token",
+            )
+
+    @patch("extern.password_reset.requests.post")
+    def test_email_delivery_rejects_application_errors(self, post: Mock):
+        post.return_value.json.return_value = {"status": 500}
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "email service rejected delivery",
+        ):
+            password_reset._deliver_password_reset_email(
+                "Reset User",
+                "reset@example.com",
+                "opaque-password-reset-token",
+            )
 
     @patch("extern.wechat.send_wechat")
     def test_wechat_token_is_not_persisted_in_a_scheduler_job(

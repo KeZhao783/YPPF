@@ -1,7 +1,7 @@
 """Non-persistent, bounded delivery for password-reset credentials."""
 
 import json
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime
 from threading import BoundedSemaphore
 from typing import Callable
@@ -33,16 +33,55 @@ def _run_delivery(delivery: Callable, args: tuple) -> None:
         _delivery_slots.release()
 
 
-def _queue_delivery(delivery: Callable, *args) -> bool:
+def _submit_delivery(runner: Callable, *args) -> bool:
     if not _delivery_slots.acquire(blocking=False):
         logger.warning("Password-reset delivery queue is full")
         return False
     try:
-        _delivery_executor.submit(_run_delivery, delivery, args)
+        _delivery_executor.submit(runner, *args)
     except RuntimeError:
         _delivery_slots.release()
         logger.warning("Password-reset delivery queue is unavailable")
         return False
+    return True
+
+
+def _queue_delivery(delivery: Callable, *args) -> bool:
+    return _submit_delivery(_run_delivery, delivery, args)
+
+
+def _run_prepared_delivery(
+    delivery: Callable,
+    prepared_args: Future[tuple | None],
+) -> None:
+    try:
+        args = prepared_args.result()
+        if args is not None:
+            delivery(*args)
+    except Exception:
+        # Preparation and delivery errors must not copy credentials into logs.
+        logger.error("Password-reset credential delivery failed")
+    finally:
+        _delivery_slots.release()
+
+
+def _queue_prepared_delivery(
+    delivery: Callable,
+    prepare_args: Callable[[], tuple | None],
+) -> bool:
+    prepared_args: Future[tuple | None] = Future()
+    if not _submit_delivery(
+        _run_prepared_delivery,
+        delivery,
+        prepared_args,
+    ):
+        return False
+    try:
+        args = prepare_args()
+    except BaseException:
+        prepared_args.set_result(None)
+        raise
+    prepared_args.set_result(args)
     return True
 
 
@@ -68,11 +107,15 @@ def _deliver_password_reset_email(
         "private_level": 0,
         "secret": CONFIG.email.hasher.encode(message),
     })
-    requests.post(
+    response = requests.post(
         CONFIG.email.url,
         post_data,
         timeout=6,
     )
+    response.raise_for_status()
+    result = response.json()
+    if not isinstance(result, dict) or result.get("status") != 200:
+        raise RuntimeError("Password-reset email service rejected delivery")
 
 
 def queue_password_reset_email(
@@ -90,3 +133,21 @@ def queue_password_reset_email(
 
 def queue_password_reset_wechat(username: str, token: str) -> bool:
     return _queue_delivery(send_password_reset_token, username, token)
+
+
+def queue_prepared_password_reset_email(
+    prepare_args: Callable[[], tuple[str, str, str] | None],
+) -> bool:
+    return _queue_prepared_delivery(
+        _deliver_password_reset_email,
+        prepare_args,
+    )
+
+
+def queue_prepared_password_reset_wechat(
+    prepare_args: Callable[[], tuple[str, str] | None],
+) -> bool:
+    return _queue_prepared_delivery(
+        send_password_reset_token,
+        prepare_args,
+    )
