@@ -9,6 +9,7 @@ from django.db import transaction
 from django.db.models import Q, F, Sum, QuerySet
 from django.contrib.auth.password_validation import CommonPasswordValidator, NumericPasswordValidator
 from django.core.exceptions import ValidationError
+from django.core.validators import validate_email
 from django.views.decorators.csrf import csrf_protect
 from django.views.decorators.http import require_http_methods
 
@@ -1469,7 +1470,11 @@ def forgetPassword(request: HttpRequest):
                         except NaturalPerson.DoesNotExist:
                             pass
                     if person is not None:
-                        if action == "email" and person.email:
+                        if action == "email":
+                            try:
+                                validate_email(person.email)
+                            except ValidationError:
+                                return None
                             token = utils.create_password_reset_token(
                                 request, user)
                             return person.name, person.email, token

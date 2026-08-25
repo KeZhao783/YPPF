@@ -221,19 +221,21 @@ def create_password_reset_token(
     token = f'{challenge_id}.{signed_value}'
 
     with transaction.atomic():
-        User.objects.select_for_update().get(pk=user.pk)
+        locked_user = User.objects.select_for_update().get(pk=user.pk)
         PasswordResetChallenge.objects.filter(
-            user=user,
+            user=locked_user,
             consumed_at__isnull=True,
             invalidated_at__isnull=True,
         ).update(invalidated_at=now)
         PasswordResetChallenge.objects.create(
             id=challenge_id,
-            user=user,
+            user=locked_user,
             token_digest=_password_reset_digest(
                 token, salt='app.password-reset.token-digest'),
             password_digest=_password_reset_digest(
-                user.password, salt='app.password-reset.password-state'),
+                locked_user.password,
+                salt='app.password-reset.password-state',
+            ),
             device_digest=_password_reset_digest(
                 session_key, salt='app.password-reset.device'),
             ip_digest=_password_reset_digest(

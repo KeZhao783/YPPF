@@ -78,6 +78,23 @@ class PasswordResetDomainTests(TestCase):
         self.user.refresh_from_db()
         self.assertTrue(self.user.check_password("owner-secured-password"))
 
+    def test_token_uses_password_state_from_the_locked_user(self):
+        stale_user = self.user
+        current_user = User.objects.get(pk=self.user.pk)
+        current_user.set_password("changed-password")
+        current_user.save(update_fields=["password"])
+
+        token = utils.create_password_reset_token(
+            self.request, stale_user, now=self.now)
+
+        self.assertTrue(utils.reset_password_from_token(
+            self.request,
+            current_user.username,
+            token,
+            "Secure-pass-123",
+            now=self.now,
+        ))
+
     def test_token_rejects_a_different_submitted_username(self):
         other_user = User.objects.create_user(
             username="other-reset-user",
@@ -497,7 +514,7 @@ class ForgetPasswordViewTests(TestCase):
             name="View Reset User",
             password="old-password",
         )
-        models.NaturalPerson.objects.create(
+        self.person = models.NaturalPerson.objects.create(
             self.user,
             name="Reset",
             email="reset@example.com",
@@ -620,6 +637,48 @@ class ForgetPasswordViewTests(TestCase):
             dict(models.PasswordResetThrottle.objects.values_list(
                 "scope", "attempts")),
             throttle_attempts,
+        )
+        reset = self.client.post(reverse("forgetpw"), {
+            "action": "reset",
+            "username": self.user.username,
+            "token": token,
+            "new_password": "Secure-pass-123",
+            "confirm_password": "Secure-pass-123",
+        })
+        self.assertRedirects(
+            reset, reverse("index") + "?modinfo=success")
+
+    def test_invalid_stored_email_preserves_existing_challenge(self):
+        _, token = self.send_email_token()
+        challenge = models.PasswordResetChallenge.objects.get(user=self.user)
+        models.NaturalPerson.objects.filter(pk=self.person.pk).update(
+            email="none")
+        prepared = []
+
+        def queue_delivery(prepare):
+            prepared.append(prepare())
+            return True
+
+        with patch(
+            "app.views.queue_prepared_password_reset_email",
+            side_effect=queue_delivery,
+        ):
+            response = self.client.post(reverse("forgetpw"), {
+                "action": "email",
+                "username": self.user.username,
+            })
+
+        self.assertContains(
+            response,
+            "若账号及联系方式有效，重置凭证将发送至已绑定渠道",
+        )
+        self.assertEqual(prepared, [None])
+        challenge.refresh_from_db()
+        self.assertIsNone(challenge.invalidated_at)
+        self.assertEqual(
+            models.PasswordResetChallenge.objects.filter(
+                user=self.user).count(),
+            1,
         )
         reset = self.client.post(reverse("forgetpw"), {
             "action": "reset",
