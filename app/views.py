@@ -1,6 +1,5 @@
 import json
 import random
-import requests
 from datetime import datetime, timedelta
 from typing import cast, List, Tuple
 
@@ -44,8 +43,11 @@ from app.utils import (
     update_related_account_in_session,
 )
 from extern.wechat import (
-    send_password_reset_token,
     invite_to_wechat,
+)
+from extern.password_reset import (
+    queue_password_reset_email,
+    queue_password_reset_wechat,
 )
 from app.notification_utils import (
     notification_status_change,
@@ -1466,39 +1468,13 @@ def forgetPassword(request: HttpRequest):
                         if action == "email" and person.email:
                             token = utils.create_password_reset_token(
                                 request, user)
-                            msg = (
-                                f"<h3><b>亲爱的{person.name}同学：</b></h3><br/>"
-                                "您好！本次密码重置凭证为：<br/>"
-                                f'<p style="color:orange">{token}</p>'
-                                "凭证十分钟内有效，且只能使用一次。<br/>"
-                                "<br/>元培学院开发组<br/>"
-                                + datetime.now().strftime("%Y年%m月%d日")
-                            )
-                            post_data = json.dumps({
-                                "sender": "元培学院开发组",
-                                "toaddrs": [person.email],
-                                "subject": "YPPF密码重置",
-                                "content": msg,
-                                "html": True,
-                                "private_level": 0,
-                                "secret": CONFIG.email.hasher.encode(msg),
-                            })
-                            try:
-                                requests.post(
-                                    CONFIG.email.url,
-                                    post_data,
-                                    timeout=6,
-                                )
-                            except requests.RequestException:
-                                pass
+                            queue_password_reset_email(
+                                person.name, person.email, token)
                         elif action == "wechat":
                             token = utils.create_password_reset_token(
                                 request, user)
-                            try:
-                                send_password_reset_token(
-                                    user.username, token)
-                            except Exception:
-                                pass
+                            queue_password_reset_wechat(
+                                user.username, token)
             display = succeed(
                 "若账号及联系方式有效，重置凭证将发送至已绑定渠道")
             display.update(alert=True, noshow=True, colddown=60)

@@ -61,12 +61,27 @@ def _password_reset_digest(value: str, *, salt: str) -> str:
     return salted_hmac(salt, value).hexdigest()
 
 
+def _canonical_password_reset_username(username: str) -> str:
+    normalized = User.normalize_username(username.strip())
+    return (
+        User.objects.filter(username__iexact=normalized)
+        .values_list('username', flat=True)
+        .first()
+        or normalized
+    )
+
+
+def _password_reset_client_ip(request: HttpRequest) -> str:
+    """Use the direct peer address unless trusted proxies are configured."""
+    return request.META.get('REMOTE_ADDR') or 'unknown'
+
+
 def _password_reset_context(request: HttpRequest, username: str):
     if request.session.session_key is None:
         request.session.create()
     return (
-        User.normalize_username(username.strip()),
-        get_ip(request) or 'unknown',
+        _canonical_password_reset_username(username),
+        _password_reset_client_ip(request),
         request.session.session_key,
     )
 
@@ -217,6 +232,8 @@ def create_password_reset_token(
             user=user,
             token_digest=_password_reset_digest(
                 token, salt='app.password-reset.token-digest'),
+            password_digest=_password_reset_digest(
+                user.password, salt='app.password-reset.password-state'),
             device_digest=_password_reset_digest(
                 session_key, salt='app.password-reset.device'),
             ip_digest=_password_reset_digest(
@@ -294,7 +311,8 @@ def reset_password_from_token(
             payload.get('purpose') == PASSWORD_RESET_PURPOSE
             and payload.get('challenge') == str(challenge.id)
             and payload.get('user') == user.pk
-            and username == user.username
+            and User.objects.filter(
+                pk=user.pk, username__iexact=username).exists()
             and challenge.consumed_at is None
             and challenge.invalidated_at is None
             and now <= challenge.expires_at
@@ -302,6 +320,13 @@ def reset_password_from_token(
                 challenge.token_digest,
                 _password_reset_digest(
                     token, salt='app.password-reset.token-digest'),
+            )
+            and constant_time_compare(
+                challenge.password_digest,
+                _password_reset_digest(
+                    user.password,
+                    salt='app.password-reset.password-state',
+                ),
             )
             and constant_time_compare(
                 challenge.device_digest,

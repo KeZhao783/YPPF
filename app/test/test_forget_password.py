@@ -1,6 +1,5 @@
 from datetime import datetime, timedelta
 import json
-import re
 import uuid
 from unittest.mock import Mock, patch
 
@@ -11,6 +10,7 @@ from django.urls import reverse
 from django.utils.crypto import salted_hmac
 
 from app import models, utils
+from extern import password_reset
 from extern.wechat import send_password_reset_token
 from generic.models import User
 
@@ -48,6 +48,34 @@ class PasswordResetDomainTests(TestCase):
         ))
         self.user.refresh_from_db()
         self.assertTrue(self.user.check_password("Secure-pass-123"))
+
+    def test_token_accepts_database_equivalent_username_casing(self):
+        token = utils.create_password_reset_token(
+            self.request, self.user, now=self.now)
+
+        self.assertTrue(utils.reset_password_from_token(
+            self.request,
+            self.user.username.upper(),
+            token,
+            "Secure-pass-123",
+            now=self.now,
+        ))
+
+    def test_password_change_invalidates_an_outstanding_token(self):
+        token = utils.create_password_reset_token(
+            self.request, self.user, now=self.now)
+        self.user.set_password("owner-secured-password")
+        self.user.save(update_fields=["password"])
+
+        self.assertFalse(utils.reset_password_from_token(
+            self.request,
+            self.user.username,
+            token,
+            "Attacker-pass-123",
+            now=self.now,
+        ))
+        self.user.refresh_from_db()
+        self.assertTrue(self.user.check_password("owner-secured-password"))
 
     def test_token_rejects_a_different_submitted_username(self):
         other_user = User.objects.create_user(
@@ -98,6 +126,20 @@ class PasswordResetDomainTests(TestCase):
         ))
         self.user.refresh_from_db()
         self.assertTrue(self.user.check_password("old-password"))
+
+    def test_token_ignores_untrusted_forwarded_for(self):
+        self.request.META["HTTP_X_FORWARDED_FOR"] = "198.51.100.1"
+        token = utils.create_password_reset_token(
+            self.request, self.user, now=self.now)
+        self.request.META["HTTP_X_FORWARDED_FOR"] = "203.0.113.99"
+
+        self.assertTrue(utils.reset_password_from_token(
+            self.request,
+            self.user.username,
+            token,
+            "Secure-pass-123",
+            now=self.now,
+        ))
 
     def test_token_rejects_a_different_signed_purpose(self):
         token = utils.create_password_reset_token(
@@ -291,6 +333,28 @@ class PasswordResetDomainTests(TestCase):
 
         self.assertEqual(results, [True, True, True, False])
 
+    def test_account_request_limit_uses_canonical_username(self):
+        results = [
+            utils.check_password_reset_request_rate(
+                self.request,
+                (
+                    self.user.username.upper()
+                    if index % 2
+                    else self.user.username
+                ),
+                now=self.now,
+            )
+            for index in range(4)
+        ]
+
+        self.assertEqual(results, [True, True, True, False])
+        self.assertEqual(
+            models.PasswordResetThrottle.objects.filter(
+                scope=models.PasswordResetThrottle.Scope.REQUEST_ACCOUNT,
+            ).count(),
+            1,
+        )
+
     def test_sixth_device_request_is_rate_limited(self):
         results = [
             utils.check_password_reset_request_rate(
@@ -438,18 +502,13 @@ class ForgetPasswordViewTests(TestCase):
             email="reset@example.com",
         )
 
-    def send_email_token(self):
-        with patch("app.views.requests.post") as post:
-            post.return_value = Mock()
+    def send_email_token(self, username=None):
+        with patch("app.views.queue_password_reset_email") as queue:
             response = self.client.post(reverse("forgetpw"), {
                 "action": "email",
-                "username": self.user.username,
+                "username": username or self.user.username,
             })
-            email_data = json.loads(post.call_args.args[1])
-        token_match = re.search(
-            r'color:orange">([^<]+)', email_data["content"])
-        self.assertIsNotNone(token_match)
-        return response, token_match.group(1)
+        return response, queue.call_args.args[2]
 
     def test_post_requires_csrf(self):
         response = Client(enforce_csrf_checks=True).post(
@@ -480,14 +539,10 @@ class ForgetPasswordViewTests(TestCase):
 
         self.assertEqual(response.status_code, 405)
 
-    @patch("app.views.requests.post")
+    @patch("app.views.queue_password_reset_email")
     def test_existing_and_missing_accounts_get_same_delivery_message(
-        self, post: Mock,
+        self, queue: Mock,
     ):
-        email_response = Mock()
-        email_response.json.return_value = {"status": 200, "data": {}}
-        post.return_value = email_response
-
         existing = self.client.post(reverse("forgetpw"), {
             "action": "email",
             "username": self.user.username,
@@ -500,13 +555,12 @@ class ForgetPasswordViewTests(TestCase):
         message = "若账号及联系方式有效，重置凭证将发送至已绑定渠道"
         self.assertContains(existing, message)
         self.assertContains(missing, message)
+        queue.assert_called_once()
 
-    @patch("app.views.requests.post")
+    @patch("app.views.queue_password_reset_email")
     def test_fourth_account_delivery_request_creates_no_challenge(
-        self, post: Mock,
+        self, queue: Mock,
     ):
-        post.return_value = Mock()
-
         for _ in range(4):
             self.client.post(reverse("forgetpw"), {
                 "action": "email",
@@ -518,6 +572,21 @@ class ForgetPasswordViewTests(TestCase):
                 user=self.user).count(),
             3,
         )
+
+    def test_case_variant_request_and_reset_use_the_same_account(self):
+        username = self.user.username.upper()
+        _, token = self.send_email_token(username)
+
+        response = self.client.post(reverse("forgetpw"), {
+            "action": "reset",
+            "username": username,
+            "token": token,
+            "new_password": "Secure-pass-123",
+            "confirm_password": "Secure-pass-123",
+        })
+
+        self.assertRedirects(
+            response, reverse("index") + "?modinfo=success")
 
     def test_full_account_takeover_regression_requires_normal_login(self):
         _, token = self.send_email_token()
@@ -607,6 +676,47 @@ class ForgetPasswordViewTests(TestCase):
 
 
 class PasswordResetDeliveryTests(TestCase):
+    @patch("extern.password_reset._delivery_executor.submit")
+    @patch("extern.password_reset._delivery_slots.acquire", return_value=True)
+    def test_email_delivery_is_queued_without_blocking_on_network(
+        self,
+        acquire: Mock,
+        submit: Mock,
+    ):
+        token = "opaque-password-reset-token"
+
+        self.assertTrue(password_reset.queue_password_reset_email(
+            "Reset User",
+            "reset@example.com",
+            token,
+        ))
+
+        acquire.assert_called_once_with(blocking=False)
+        submit.assert_called_once()
+        delivery_runner, delivery, args = submit.call_args.args
+        self.assertIs(delivery_runner, password_reset._run_delivery)
+        self.assertIs(
+            delivery,
+            password_reset._deliver_password_reset_email,
+        )
+        self.assertEqual(args[-1], token)
+
+    @patch("extern.password_reset.requests.post")
+    def test_email_delivery_contains_the_opaque_token(self, post: Mock):
+        token = "opaque-password-reset-token"
+
+        password_reset._deliver_password_reset_email(
+            "Reset User",
+            "reset@example.com",
+            token,
+        )
+
+        post.assert_called_once()
+        post_data = json.loads(post.call_args.args[1])
+        self.assertEqual(post_data["toaddrs"], ["reset@example.com"])
+        self.assertIn(token, post_data["content"])
+        self.assertEqual(post.call_args.kwargs["timeout"], 6)
+
     @patch("extern.wechat.send_wechat")
     def test_wechat_token_is_not_persisted_in_a_scheduler_job(
         self, send_wechat: Mock,

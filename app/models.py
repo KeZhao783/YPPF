@@ -2067,6 +2067,7 @@ class PasswordResetChallenge(models.Model):
         related_name='password_reset_challenges',
     )
     token_digest = models.CharField(max_length=64, unique=True)
+    password_digest = models.CharField(max_length=64)
     device_digest = models.CharField(max_length=64)
     ip_digest = models.CharField(max_length=64)
     created_at = models.DateTimeField()
