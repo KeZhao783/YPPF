@@ -9,6 +9,7 @@ from typing import cast, overload, Literal
 
 import xlwt
 import imghdr
+from django.conf import settings
 from django.contrib import auth
 from django.contrib.auth.password_validation import validate_password
 from django.core import signing
@@ -36,20 +37,29 @@ from app.models import (
 
 PASSWORD_RESET_PURPOSE = 'password-reset'
 PASSWORD_RESET_SIGNING_SALT = 'app.password-reset.token'
-PASSWORD_RESET_TOKEN_SECONDS = 10 * 60
-PASSWORD_RESET_TOKEN_ATTEMPTS = 5
-PASSWORD_RESET_WINDOW = timedelta(minutes=15)
-PASSWORD_RESET_LOCK = timedelta(minutes=15)
-PASSWORD_RESET_RETENTION = timedelta(days=1)
+PASSWORD_RESET_TOKEN_SECONDS = CONFIG.password_reset_token_seconds
+PASSWORD_RESET_TOKEN_ATTEMPTS = CONFIG.password_reset_token_attempts
+PASSWORD_RESET_WINDOW = timedelta(
+    seconds=CONFIG.password_reset_window_seconds)
+PASSWORD_RESET_LOCK = timedelta(
+    seconds=CONFIG.password_reset_lock_seconds)
+PASSWORD_RESET_RETENTION = timedelta(
+    seconds=CONFIG.password_reset_retention_seconds)
 PASSWORD_RESET_REQUEST_LIMITS = {
-    PasswordResetThrottle.Scope.REQUEST_ACCOUNT: 3,
-    PasswordResetThrottle.Scope.REQUEST_DEVICE: 5,
-    PasswordResetThrottle.Scope.REQUEST_IP: 10,
+    PasswordResetThrottle.Scope.REQUEST_ACCOUNT:
+        CONFIG.password_reset_request_limits['account'],
+    PasswordResetThrottle.Scope.REQUEST_DEVICE:
+        CONFIG.password_reset_request_limits['device'],
+    PasswordResetThrottle.Scope.REQUEST_IP:
+        CONFIG.password_reset_request_limits['ip'],
 }
 PASSWORD_RESET_VERIFY_LIMITS = {
-    PasswordResetThrottle.Scope.VERIFY_ACCOUNT: 10,
-    PasswordResetThrottle.Scope.VERIFY_DEVICE: 10,
-    PasswordResetThrottle.Scope.VERIFY_IP: 10,
+    PasswordResetThrottle.Scope.VERIFY_ACCOUNT:
+        CONFIG.password_reset_verify_limits['account'],
+    PasswordResetThrottle.Scope.VERIFY_DEVICE:
+        CONFIG.password_reset_verify_limits['device'],
+    PasswordResetThrottle.Scope.VERIFY_IP:
+        CONFIG.password_reset_verify_limits['ip'],
 }
 
 
@@ -76,13 +86,24 @@ def _password_reset_client_ip(request: HttpRequest) -> str:
     return request.META.get('REMOTE_ADDR') or 'unknown'
 
 
+def _password_reset_device_identifier(request: HttpRequest) -> str:
+    csrf_cookie = (
+        request.META.get('CSRF_COOKIE')
+        or request.COOKIES.get(settings.CSRF_COOKIE_NAME)
+    )
+    if csrf_cookie:
+        return f'csrf:{csrf_cookie}'
+    session_key = request.session.session_key
+    if session_key is not None:
+        return f'session:{session_key}'
+    return f'ip:{_password_reset_client_ip(request)}'
+
+
 def _password_reset_context(request: HttpRequest, username: str):
-    if request.session.session_key is None:
-        request.session.create()
     return (
         _canonical_password_reset_username(username),
         _password_reset_client_ip(request),
-        request.session.session_key,
+        _password_reset_device_identifier(request),
     )
 
 
@@ -170,11 +191,11 @@ def _lock_password_reset_limits(
 def _password_reset_verification_identifiers(
     username: str,
     ip_address: str,
-    session_key: str,
+    device_identifier: str,
 ) -> dict[PasswordResetThrottle.Scope, str]:
     return {
         PasswordResetThrottle.Scope.VERIFY_ACCOUNT: username,
-        PasswordResetThrottle.Scope.VERIFY_DEVICE: session_key,
+        PasswordResetThrottle.Scope.VERIFY_DEVICE: device_identifier,
         PasswordResetThrottle.Scope.VERIFY_IP: ip_address,
     }
 
@@ -186,12 +207,12 @@ def check_password_reset_request_rate(
     now: datetime | None = None,
 ) -> bool:
     now = now or datetime.now()
-    username, ip_address, session_key = _password_reset_context(
+    username, ip_address, device_identifier = _password_reset_context(
         request, username)
     return _consume_password_reset_limits(
         {
             PasswordResetThrottle.Scope.REQUEST_ACCOUNT: username,
-            PasswordResetThrottle.Scope.REQUEST_DEVICE: session_key,
+            PasswordResetThrottle.Scope.REQUEST_DEVICE: device_identifier,
             PasswordResetThrottle.Scope.REQUEST_IP: ip_address,
         },
         PASSWORD_RESET_REQUEST_LIMITS,
@@ -206,7 +227,7 @@ def create_password_reset_token(
     now: datetime | None = None,
 ) -> str:
     now = now or datetime.now()
-    _, ip_address, session_key = _password_reset_context(
+    _, ip_address, device_identifier = _password_reset_context(
         request, user.username)
     challenge_id = uuid.uuid4()
     signed_value = signing.dumps(
@@ -222,11 +243,6 @@ def create_password_reset_token(
 
     with transaction.atomic():
         locked_user = User.objects.select_for_update().get(pk=user.pk)
-        PasswordResetChallenge.objects.filter(
-            user=locked_user,
-            consumed_at__isnull=True,
-            invalidated_at__isnull=True,
-        ).update(invalidated_at=now)
         PasswordResetChallenge.objects.create(
             id=challenge_id,
             user=locked_user,
@@ -237,7 +253,7 @@ def create_password_reset_token(
                 salt='app.password-reset.password-state',
             ),
             device_digest=_password_reset_digest(
-                session_key, salt='app.password-reset.device'),
+                device_identifier, salt='app.password-reset.device'),
             ip_digest=_password_reset_digest(
                 ip_address, salt='app.password-reset.ip'),
             created_at=now,
@@ -272,10 +288,10 @@ def reset_password_from_token(
     now: datetime | None = None,
 ) -> bool:
     now = now or datetime.now()
-    username, ip_address, session_key = _password_reset_context(
+    username, ip_address, device_identifier = _password_reset_context(
         request, username)
     identifiers = _password_reset_verification_identifiers(
-        username, ip_address, session_key)
+        username, ip_address, device_identifier)
     if not _consume_password_reset_limits(
         identifiers, PASSWORD_RESET_VERIFY_LIMITS, now):
         return False
@@ -333,7 +349,7 @@ def reset_password_from_token(
             and constant_time_compare(
                 challenge.device_digest,
                 _password_reset_digest(
-                    session_key, salt='app.password-reset.device'),
+                    device_identifier, salt='app.password-reset.device'),
             )
             and constant_time_compare(
                 challenge.ip_digest,

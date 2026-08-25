@@ -1,17 +1,26 @@
 from datetime import datetime, timedelta
 import json
+from threading import Barrier, Thread
 import uuid
 from unittest.mock import Mock, patch
 
 import requests
+from django.conf import settings
 from django.contrib.sessions.middleware import SessionMiddleware
+from django.contrib.sessions.models import Session
 from django.core import signing
-from django.test import Client, RequestFactory, TestCase
+from django.db import DatabaseError, close_old_connections
+from django.test import (
+    Client,
+    RequestFactory,
+    TestCase,
+    TransactionTestCase,
+)
 from django.urls import reverse
 from django.utils.crypto import salted_hmac
 
 from app import models, utils
-from extern import password_reset
+from extern import password_reset, wechat
 from extern.wechat import send_password_reset_token
 from generic.models import User
 
@@ -253,6 +262,37 @@ class PasswordResetDomainTests(TestCase):
         self.user.refresh_from_db()
         self.assertTrue(self.user.check_password("Secure-pass-123"))
 
+    def test_earlier_queued_token_remains_valid_until_password_changes(self):
+        first_token = utils.create_password_reset_token(
+            self.request, self.user, now=self.now)
+        second_token = utils.create_password_reset_token(
+            self.request,
+            self.user,
+            now=self.now + timedelta(seconds=1),
+        )
+
+        challenges = models.PasswordResetChallenge.objects.filter(
+            user=self.user).order_by("created_at")
+        self.assertEqual(challenges.count(), 2)
+        self.assertTrue(all(
+            challenge.invalidated_at is None
+            for challenge in challenges
+        ))
+        self.assertTrue(utils.reset_password_from_token(
+            self.request,
+            self.user.username,
+            first_token,
+            "Secure-pass-123",
+            now=self.now + timedelta(seconds=2),
+        ))
+        self.assertFalse(utils.reset_password_from_token(
+            self.request,
+            self.user.username,
+            second_token,
+            "Another-pass-123",
+            now=self.now + timedelta(seconds=2),
+        ))
+
     def test_fifth_bad_signature_invalidates_challenge(self):
         token = utils.create_password_reset_token(
             self.request, self.user, now=self.now)
@@ -351,6 +391,19 @@ class PasswordResetDomainTests(TestCase):
 
         self.assertEqual(results, [True, True, True, False])
 
+    def test_request_rate_recovers_after_window_and_lock(self):
+        for _ in range(3):
+            self.assertTrue(utils.check_password_reset_request_rate(
+                self.request, self.user.username, now=self.now))
+        self.assertFalse(utils.check_password_reset_request_rate(
+            self.request, self.user.username, now=self.now))
+
+        self.assertTrue(utils.check_password_reset_request_rate(
+            self.request,
+            self.user.username,
+            now=self.now + timedelta(minutes=16),
+        ))
+
     def test_account_request_limit_uses_canonical_username(self):
         results = [
             utils.check_password_reset_request_rate(
@@ -410,6 +463,40 @@ class PasswordResetDomainTests(TestCase):
         ]
 
         self.assertEqual(results, [True] * 10 + [False])
+
+    def test_rejected_requests_do_not_persist_anonymous_sessions(self):
+        session_count = Session.objects.count()
+        results = []
+        for index in range(11):
+            request = RequestFactory().post(
+                "/forgetpw/",
+                REMOTE_ADDR="198.51.100.30",
+            )
+            SessionMiddleware(lambda request: None).process_request(request)
+            request.META["CSRF_COOKIE"] = f"device-cookie-{index}"
+            results.append(utils.check_password_reset_request_rate(
+                request,
+                f"anonymous-user-{index}",
+                now=self.now,
+            ))
+            self.assertIsNone(request.session.session_key)
+
+        self.assertEqual(results, [True] * 10 + [False])
+        self.assertEqual(Session.objects.count(), session_count)
+
+    @patch(
+        "app.utils._consume_password_reset_limits",
+        side_effect=DatabaseError,
+    )
+    def test_throttle_backend_errors_fail_closed(self, consume: Mock):
+        with self.assertRaises(DatabaseError):
+            utils.check_password_reset_request_rate(
+                self.request,
+                self.user.username,
+                now=self.now,
+            )
+
+        self.assertFalse(models.PasswordResetChallenge.objects.exists())
 
     def test_eleventh_account_verification_is_rate_limited(self):
         token = utils.create_password_reset_token(
@@ -507,12 +594,123 @@ class PasswordResetDomainTests(TestCase):
             pk=active_throttle.pk).exists())
 
 
+class PasswordResetConcurrencyTests(TransactionTestCase):
+    reset_sequences = True
+
+    def make_request(self):
+        request = RequestFactory().post(
+            "/forgetpw/",
+            REMOTE_ADDR="192.0.2.40",
+        )
+        SessionMiddleware(lambda request: None).process_request(request)
+        request.META["CSRF_COOKIE"] = "shared-concurrency-device"
+        return request
+
+    def test_concurrent_token_consumption_succeeds_only_once(self):
+        user = User.objects.create_user(
+            username="concurrent-reset-user",
+            name="Concurrent Reset User",
+            password="old-password",
+        )
+        token = utils.create_password_reset_token(
+            self.make_request(),
+            user,
+            now=datetime(2026, 8, 16, 12, 0, 0),
+        )
+        barrier = Barrier(3)
+        results = []
+        errors = []
+
+        def reset_password(password):
+            close_old_connections()
+            try:
+                request = self.make_request()
+                barrier.wait()
+                results.append(utils.reset_password_from_token(
+                    request,
+                    user.username,
+                    token,
+                    password,
+                    now=datetime(2026, 8, 16, 12, 0, 1),
+                ))
+            except Exception as error:
+                errors.append(error)
+            finally:
+                close_old_connections()
+
+        threads = [
+            Thread(target=reset_password, args=("G7!violet-River-2026",)),
+            Thread(target=reset_password, args=("N8!amber-Forest-2026",)),
+        ]
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        for thread in threads:
+            thread.join()
+
+        if errors:
+            raise errors[0]
+        self.assertCountEqual(results, [True, False])
+        challenge = models.PasswordResetChallenge.objects.get()
+        self.assertIsNotNone(challenge.consumed_at)
+
+    def test_concurrent_failures_are_all_recorded(self):
+        user = User.objects.create_user(
+            username="concurrent-failure-user",
+            name="Concurrent Failure User",
+            password="old-password",
+        )
+        token = utils.create_password_reset_token(
+            self.make_request(),
+            user,
+            now=datetime(2026, 8, 16, 12, 0, 0),
+        )
+        challenge_id, signed_value = token.split(".", 1)
+        replacement = "x" if signed_value[-1] != "x" else "y"
+        bad_token = f"{challenge_id}.{signed_value[:-1]}{replacement}"
+        barrier = Barrier(3)
+        results = []
+        errors = []
+
+        def reject_token():
+            close_old_connections()
+            try:
+                request = self.make_request()
+                barrier.wait()
+                results.append(utils.reset_password_from_token(
+                    request,
+                    user.username,
+                    bad_token,
+                    "G7!violet-River-2026",
+                    now=datetime(2026, 8, 16, 12, 0, 1),
+                ))
+            except Exception as error:
+                errors.append(error)
+            finally:
+                close_old_connections()
+
+        threads = [Thread(target=reject_token) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        for thread in threads:
+            thread.join()
+
+        if errors:
+            raise errors[0]
+        self.assertEqual(results, [False, False])
+        challenge = models.PasswordResetChallenge.objects.get()
+        self.assertEqual(challenge.failed_attempts, 2)
+
+
 class ForgetPasswordViewTests(TestCase):
     def setUp(self):
         self.user = User.objects.create_user(
             username="view-reset-user",
             name="View Reset User",
             password="old-password",
+            utype=User.Type.PERSON,
+            is_newuser=False,
         )
         self.person = models.NaturalPerson.objects.create(
             self.user,
@@ -565,6 +763,61 @@ class ForgetPasswordViewTests(TestCase):
         response = self.client.put(reverse("forgetpw"))
 
         self.assertEqual(response.status_code, 405)
+
+    def test_account_without_email_gets_the_generic_delivery_response(self):
+        models.NaturalPerson.objects.filter(pk=self.person.pk).update(
+            email=None)
+        prepared = []
+
+        def queue_delivery(prepare):
+            prepared.append(prepare())
+            return True
+
+        with patch(
+            "app.views.queue_prepared_password_reset_email",
+            side_effect=queue_delivery,
+        ):
+            response = self.client.post(reverse("forgetpw"), {
+                "action": "email",
+                "username": self.user.username,
+            })
+
+        self.assertContains(
+            response,
+            "若账号及联系方式有效，重置凭证将发送至已绑定渠道",
+        )
+        self.assertEqual(prepared, [None])
+        self.assertFalse(models.PasswordResetChallenge.objects.exists())
+
+    def test_modpw_requires_csrf(self):
+        client = Client(enforce_csrf_checks=True)
+        client.force_login(self.user)
+        get_response = client.get(reverse("modpw"))
+
+        self.assertEqual(get_response.status_code, 200)
+        self.assertIn(settings.CSRF_COOKIE_NAME, client.cookies)
+        response = client.post(reverse("modpw"), {
+            "pw": "old-password",
+            "new": "Secure-pass-123",
+        })
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_modpw_ignores_legacy_forgetpw_session_marker(self):
+        self.client.force_login(self.user)
+        session = self.client.session
+        session["forgetpw"] = "yes"
+        session.save()
+
+        response = self.client.post(reverse("modpw"), {
+            "pw": "Bypass-pass-123",
+            "new": "Bypass-pass-123",
+        })
+
+        self.assertEqual(response.status_code, 200)
+        self.user.refresh_from_db()
+        self.assertTrue(self.user.check_password("old-password"))
+        self.assertFalse(self.user.check_password("Bypass-pass-123"))
 
     @patch("app.views.queue_prepared_password_reset_email")
     def test_existing_and_missing_accounts_get_same_delivery_message(
@@ -920,6 +1173,53 @@ class PasswordResetDeliveryTests(TestCase):
                 "opaque-password-reset-token",
             )
 
+    @patch("extern.password_reset._delivery_slots.release")
+    @patch.object(password_reset.logger, "error")
+    def test_delivery_failure_log_omits_the_token(
+        self,
+        error: Mock,
+        release: Mock,
+    ):
+        token = "opaque-password-reset-token"
+        delivery = Mock(side_effect=RuntimeError(token))
+
+        password_reset._run_delivery(delivery, (token,))
+
+        error.assert_called_once_with(
+            "Password-reset credential delivery failed")
+        self.assertNotIn(token, error.call_args.args[0])
+        release.assert_called_once_with()
+
+    @patch.object(wechat.logger, "warning")
+    @patch(
+        "extern.wechat._post_and_parse",
+        return_value=("service rejected request", None),
+    )
+    @patch(
+        "extern.wechat._get_available_users",
+        return_value=["1234567890"],
+    )
+    def test_wechat_delivery_failure_is_propagated_without_secrets(
+        self,
+        available_users: Mock,
+        post_and_parse: Mock,
+        warning: Mock,
+    ):
+        username = "1234567890"
+        token = "opaque-password-reset-token"
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "WeChat message delivery failed",
+        ):
+            send_password_reset_token(username, token)
+
+        warning.assert_called_once_with(
+            "Sensitive WeChat message delivery failed")
+        warning_message = warning.call_args.args[0]
+        self.assertNotIn(username, warning_message)
+        self.assertNotIn(token, warning_message)
+
     @patch("extern.wechat.send_wechat")
     def test_wechat_token_is_not_persisted_in_a_scheduler_job(
         self, send_wechat: Mock,
@@ -933,3 +1233,4 @@ class PasswordResetDeliveryTests(TestCase):
         self.assertIn(token, args[2])
         self.assertEqual(args[1], "YPPF密码重置")
         self.assertFalse(kwargs["multithread"])
+        self.assertTrue(kwargs["raise_on_failure"])

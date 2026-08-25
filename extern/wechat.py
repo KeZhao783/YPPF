@@ -96,6 +96,7 @@ def _send_wechat(
     btntxt: str | None = None,
     *,
     retry_times: int = 1,
+    raise_on_failure: bool = False,
 ):
     """底层实现发送到微信，是为了方便设置定时任务"""
     post_data = {
@@ -119,13 +120,23 @@ def _send_wechat(
     for i in range(retry_times):
         errmsg, retrys = _post_and_parse(api_url, post_data, CONFIG.timeout, _parser)
         if errmsg is None:
-            logger.info(f"成功向{_log_users(users)}发送消息")
-            break
+            if raise_on_failure:
+                logger.info("Sensitive WeChat message delivery succeeded")
+            else:
+                logger.info(f"成功向{_log_users(users)}发送消息")
+            return
         if retrys is None:
-            logger.warning(f"向{_log_users(users)}发送消息失败：{errmsg}")
+            if not raise_on_failure:
+                logger.warning(f"向{_log_users(users)}发送消息失败：{errmsg}")
             break
         post_data["touser"] = retrys
-        logger.warning(f"向{_log_users(users)}发送时，{_log_users(retrys)}失败：{errmsg}")
+        if not raise_on_failure:
+            logger.warning(
+                f"向{_log_users(users)}发送时，"
+                f"{_log_users(retrys)}失败：{errmsg}")
+    if raise_on_failure:
+        logger.warning("Sensitive WeChat message delivery failed")
+        raise RuntimeError("WeChat message delivery failed")
 
 
 def send_wechat(
@@ -142,6 +153,7 @@ def send_wechat(
     multithread: bool = True,
     run_time: datetime | timedelta | None = None,
     task_id: str | None = None,
+    raise_on_failure: bool = False,
 ):
     """
     附带了去重、多线程和batch的发送；不应被服务直接调用
@@ -168,6 +180,8 @@ def send_wechat(
     """
     users = _get_available_users(users)
     if not users:
+        if raise_on_failure:
+            raise RuntimeError('WeChat message delivery failed')
         return logger.warning('没有可用用户')
     content = f'{title}<title>{message}'
     if card:
@@ -198,6 +212,7 @@ def send_wechat(
             userids, content, build_full_url(api_path, CONFIG.api_url),
             card=card, url=url, btntxt=btntxt,
             retry_times=retry_times,
+            raise_on_failure=raise_on_failure,
         )
 
 
@@ -231,6 +246,7 @@ def send_password_reset_token(stu_id: str | int, token: str):
         url='/forgetpw/',
         btntxt='重置密码',
         multithread=False,
+        raise_on_failure=True,
     )
 
 

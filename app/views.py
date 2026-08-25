@@ -1439,6 +1439,7 @@ def search(request: HttpRequest):
     return render(request, "search.html", locals())
 
 
+@ensure_csrf_cookie
 @csrf_protect
 @require_http_methods(["GET", "POST"])
 @logger.secure_view()
@@ -1523,16 +1524,15 @@ def forgetPassword(request: HttpRequest):
     return render(request, "forget_password.html", context)
 
 
+@csrf_protect
 @login_required(redirect_field_name="origin")
 @utils.check_user_access(redirect_url="/logout/", is_modpw=True)
+@require_http_methods(["GET", "POST"])
 @logger.secure_view()
 def modpw(request: UserRequest):
     """
-        可能在三种情况进入这个页面：首次登陆；忘记密码；或者常规的修改密码。
-        在忘记密码时，可以允许不输入旧的密码
-        在首次登陆时，现在写的也可以不输入旧的密码（我还没想好这样合不合适）
-            以上两种情况都可以直接进行密码修改
-        常规修改要审核旧的密码
+        首次登录时重复输入新密码；常规修改必须验证原密码。
+        忘记密码使用独立的 /forgetpw/ token 流程。
     """
     user = request.user
     isFirst = request.user.is_newuser
@@ -1543,7 +1543,6 @@ def modpw(request: UserRequest):
 
     err_code = 0
     err_message = None
-    forgetpw = request.session.get("forgetpw", "") == "yes"  # added by pht
     username = request.user.username
 
     if request.method == "POST" and request.POST:
@@ -1552,11 +1551,11 @@ def modpw(request: UserRequest):
         strict_check = True
         min_length = 8
         try:
-            if oldpassword == newpw and strict_check and not (forgetpw or isFirst):
+            if oldpassword == newpw and strict_check and not isFirst:
                 raise ValidationError(message="新密码不能与原密码相同")
             elif newpw == username and strict_check:
                 raise ValidationError(message="新密码不能与学号相同")
-            elif newpw != oldpassword and (forgetpw or isFirst):  # added by pht
+            elif newpw != oldpassword and isFirst:
                 raise ValidationError(message="两次输入的密码不匹配")
             elif len(newpw) < min_length:
                 raise ValidationError(message=f"新密码不能短于{min_length}位")
@@ -1566,21 +1565,9 @@ def modpw(request: UserRequest):
         except ValidationError as e:
             err_code = 1
             err_message = e.message
-        # if oldpassword == newpw and strict_check and not (forgetpw or isFirst):
-        #     err_code = 1
-        #     err_message = "新密码不能与原密码相同"
-        # elif newpw == username and strict_check:
-        #     err_code = 2
-        #     err_message = "新密码不能与学号相同"
-        # elif newpw != oldpassword and (forgetpw or isFirst):  # added by pht
-        #     err_code = 5
-        #     err_message = "两次输入的密码不匹配"
-        # elif len(newpw) < min_length:
-        #     err_code = 6
-        # err_message = f"新密码的长度不能少于{min_length}位"
         else:
-            # 在1、忘记密码 2、首次登录 3、验证旧密码正确 的前提下，可以修改
-            if forgetpw or isFirst:
+            # 首次登录或原密码验证成功时可以修改。
+            if isFirst:
                 userauth = True
             else:
                 userauth = auth.authenticate(
@@ -1590,16 +1577,13 @@ def modpw(request: UserRequest):
                 try:  # modified by pht: if检查是错误的，不存在时get会报错
                     user.set_password(newpw)
                     user.is_newuser = False
-                    user.save()
-
-                    if forgetpw:
-                        request.session.pop("forgetpw")  # 删除session记录
+                    user.save(update_fields=['password', 'is_newuser'])
 
                     # record_modify_with_session(request,
                     #     "首次修改密码" if isFirst else "修改密码")
                     urls = reverse("index") + "?modinfo=success"
                     return redirect(urls)
-                except:  # modified by pht: 之前使用的if检查是错误的
+                except Exception:
                     err_code = 3
                     err_message = "学号不存在"
             else:
