@@ -33,7 +33,8 @@ signed_openid（签名随机 nonce；数据库仅保存摘要）+ username + pas
         ↓
 authenticate(username, password)
         ↓
-密码失败计数达到默认 5 次，或成功使用后，凭据均失效
+密码失败计数按 openid 跨重新签发累计；达到默认 5 次后锁定至 TTL 到期
+成功使用后凭据立即失效
         ↓
 user 必须是个人账户（不能是组织）
         ↓
@@ -76,6 +77,7 @@ from rest_framework.views import APIView
 
 from api.config import CONFIG
 from api.auth.binding import (
+    WechatBindingAttemptLimitError,
     WechatBindingAuthenticationError,
     WechatBindingError,
     issue_binding_credential,
@@ -221,7 +223,8 @@ class WxCodeLoginView(APIView):
     Accepts the temporary code from ``wx.login`` and returns either a JWT
     (for already-bound users) or an opaque one-time ``signed_openid`` binding
     credential. The credential expires after ``signed_openid_ttl_minutes`` and
-    is invalid after successful use or the failed-password-attempt limit.
+    is invalid after successful use. Reissuing for the same openid rotates the
+    nonce without resetting failures; exhaustion blocks issuance until expiry.
     """
 
     permission_classes = [AllowAny]
@@ -231,9 +234,9 @@ class WxCodeLoginView(APIView):
         description=(
             "使用微信小程序 wx.login() 返回的 code 换取 openid。如果已绑定则返回 JWT；"
             "否则返回不透明的 one-time signed_openid 绑定凭据。该凭据在 "
-            "signed_openid_ttl_minutes 后过期，成功使用或达到默认 5 次密码失败"
-            "限制后失效。可选的 username 参数用于指定登录到哪个账户（必须在可登录"
-            "账户列表中）。"
+            "signed_openid_ttl_minutes 后过期；同一 openid 重新签发会轮换 nonce"
+            "但不会清零失败次数，达到默认 5 次密码失败后将锁定至 TTL 到期。"
+            "可选的 username 参数用于指定登录到哪个账户（必须在可登录账户列表中）。"
         ),
         request=WxCodeSerializer,
         responses={
@@ -340,7 +343,13 @@ class WxCodeLoginView(APIView):
                 )
 
         # 未绑定微信账号，返回临时 signed_openid 用于后续绑定
-        signed_openid = issue_binding_credential(openid)
+        try:
+            signed_openid = issue_binding_credential(openid)
+        except WechatBindingAttemptLimitError as exc:
+            return Response(
+                {"detail": str(exc)},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
         return Response(
             {
@@ -355,8 +364,8 @@ class WxBindView(APIView):
     """
     Redeem an opaque one-time ``signed_openid`` with username/password to bind
     its openid to a Django user and return a JWT. It expires after
-    ``signed_openid_ttl_minutes`` and is invalid after success or the
-    failed-password-attempt limit.
+    ``signed_openid_ttl_minutes`` and is invalid after success. Failed attempts
+    are shared by all credentials for an openid until expiry.
     """
 
     permission_classes = [AllowAny]
@@ -366,7 +375,8 @@ class WxBindView(APIView):
         description=(
             "使用账号密码兑换不透明的 one-time signed_openid 绑定凭据并绑定微信"
             "账号，绑定成功后返回 JWT。凭据在 signed_openid_ttl_minutes 后过期，"
-            "成功使用或达到默认 5 次密码失败限制后失效。"
+            "同一 openid 的重新签发不会清零失败次数；达到默认 5 次后锁定至 TTL"
+            "到期。"
         ),
         request=WxBindSerializer,
         responses={

@@ -532,6 +532,6 @@ class PendingWechatBinding(models.Model):
         verbose_name_plural = verbose_name
 
     nonce_digest = models.CharField(max_length=64, unique=True)
-    openid = models.CharField(max_length=64)
+    openid = models.CharField(max_length=64, unique=True)
     expires_at = models.DateTimeField(db_index=True)
     failed_attempts = models.PositiveSmallIntegerField(default=0)

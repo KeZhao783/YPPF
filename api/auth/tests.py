@@ -1,4 +1,6 @@
 import hashlib
+import json
+import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
@@ -14,7 +16,12 @@ from rest_framework_simplejwt.tokens import AccessToken
 from rest_framework.test import APIClient
 
 from app.models import NaturalPerson
-from api.auth.binding import BINDING_SIGNING_SALT, issue_binding_credential
+from api.auth.binding import (
+    BINDING_CREDENTIAL_PURPOSE,
+    BINDING_CREDENTIAL_VERSION,
+    BINDING_SIGNING_SALT,
+    issue_binding_credential,
+)
 from api.config import CONFIG
 from generic.models import (
     PendingWechatBinding,
@@ -116,10 +123,16 @@ class WechatBindingIssuanceTestCase(TestCase):
             mocked_datetime.now.return_value = now
             credential = issue_binding_credential("openid-v18")
 
-        nonce = signing.TimestampSigner(salt=BINDING_SIGNING_SALT).unsign(
+        signed_payload = signing.TimestampSigner(
+            salt=BINDING_SIGNING_SALT
+        ).unsign(
             credential,
             max_age=CONFIG.signed_openid_ttl_minutes * 60,
         )
+        payload = json.loads(signed_payload)
+        self.assertEqual(payload["v"], BINDING_CREDENTIAL_VERSION)
+        self.assertEqual(payload["purpose"], BINDING_CREDENTIAL_PURPOSE)
+        nonce = payload["nonce"]
         pending = PendingWechatBinding.objects.get()
         self.assertEqual(pending.openid, "openid-v18")
         self.assertEqual(
@@ -232,6 +245,32 @@ class WechatBindingApiTestCase(TestCase):
     def test_forged_credential_is_rejected(self):
         self.assertEqual(self.bind("forged").status_code, 400)
 
+    def test_wrong_purpose_credential_is_rejected(self):
+        nonce = "wrong-purpose-v18-nonce"
+        PendingWechatBinding.objects.create(
+            nonce_digest=hashlib.sha256(nonce.encode()).hexdigest(),
+            openid="openid-v18-wrong-purpose",
+            expires_at=datetime.now() + timedelta(minutes=10),
+        )
+        payload = json.dumps(
+            {
+                "v": BINDING_CREDENTIAL_VERSION,
+                "purpose": "webview_ticket",
+                "nonce": nonce,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        credential = signing.TimestampSigner(
+            salt=BINDING_SIGNING_SALT
+        ).sign(payload)
+
+        response = self.bind(credential)
+
+        self.assertEqual(response.status_code, 400)
+        self.assertTrue(PendingWechatBinding.objects.exists())
+        self.assertFalse(UserWechatProfile.objects.exists())
+
     def test_expired_database_credential_is_deleted_and_rejected(self):
         credential = self.issue()
         fixed_now = datetime(2100, 1, 1, 12, 0)
@@ -307,9 +346,73 @@ class WechatBindingApiTestCase(TestCase):
         for attempt in range(5):
             response = self.bind(credential, password="wrong-password")
             self.assertEqual(response.status_code, 401, attempt)
-        self.assertFalse(PendingWechatBinding.objects.exists())
+        pending = PendingWechatBinding.objects.get()
+        self.assertEqual(pending.failed_attempts, 5)
         self.assertEqual(self.bind(credential).status_code, 400)
         self.assertFalse(UserWechatProfile.objects.exists())
+
+    def test_reissue_preserves_openid_failures_and_lockout(self):
+        first_credential = self.issue()
+        for attempt in range(4):
+            response = self.bind(
+                first_credential,
+                password="wrong-password",
+            )
+            self.assertEqual(response.status_code, 401, attempt)
+
+        second_credential = self.issue()
+        pending = PendingWechatBinding.objects.get()
+        self.assertEqual(pending.failed_attempts, 4)
+        self.assertEqual(self.bind(first_credential).status_code, 400)
+        self.assertEqual(
+            self.bind(
+                second_credential,
+                password="wrong-password",
+            ).status_code,
+            401,
+        )
+
+        with patch(
+            "api.auth.views._fetch_openid_from_wechat",
+            return_value=("openid-v18", None),
+        ):
+            blocked = self.client.post(
+                "/api/v2/auth/wx/login/",
+                {"code": "another-fresh-code"},
+            )
+        self.assertEqual(blocked.status_code, 400)
+        self.assertEqual(PendingWechatBinding.objects.count(), 1)
+        self.assertEqual(
+            PendingWechatBinding.objects.get().failed_attempts,
+            5,
+        )
+        self.assertEqual(self.bind(second_credential).status_code, 400)
+
+    def test_failure_response_and_logs_do_not_disclose_secrets(self):
+        openid = "openid-v18-log-secret"
+        credential = self.issue(openid)
+        password = "wrong-v18-log-secret-password"
+        records = []
+
+        class CaptureHandler(logging.Handler):
+            def emit(self, record):
+                records.append(record)
+
+        handler = CaptureHandler()
+        root_logger = logging.getLogger()
+        root_logger.addHandler(handler)
+        try:
+            response = self.bind(credential, password=password)
+        finally:
+            root_logger.removeHandler(handler)
+
+        self.assertEqual(response.status_code, 401)
+        observed = response.content.decode() + "\n" + "\n".join(
+            record.getMessage() for record in records
+        )
+        self.assertNotIn(openid, observed)
+        self.assertNotIn(credential, observed)
+        self.assertNotIn(password, observed)
 
     def test_existing_profile_is_not_rebound(self):
         UserWechatProfile.objects.create(
@@ -497,11 +600,30 @@ class WechatBindingConcurrencyTestCase(TransactionTestCase):
                 },
             ),
         ]
-        outcomes = self.run_profile_create_race(requests)
+        outcomes = self.run_request_race(requests)
         self.assertCountEqual(outcomes, [200, 400])
         self.assertEqual(UserWechatProfile.objects.count(), 1)
         self.assertEqual(UserWechatProfile.objects.get().openid, openid)
         self.assertFalse(PendingWechatBinding.objects.exists())
+
+    def test_concurrent_issuance_shares_one_openid_ledger(self):
+        openid = "openid-v18-race-issuance"
+        requests = [
+            (
+                "/api/v2/auth/wx/login/",
+                {"code": f"issuer-code-{index}"},
+            )
+            for index in range(2)
+        ]
+        with patch(
+            "api.auth.views._fetch_openid_from_wechat",
+            return_value=(openid, None),
+        ):
+            outcomes = self.run_request_race(requests)
+
+        self.assertEqual(outcomes, [200, 200])
+        pending = PendingWechatBinding.objects.get(openid=openid)
+        self.assertEqual(pending.failed_attempts, 0)
 
     def test_distinct_openids_same_user_have_one_winner(self):
         openids = (
