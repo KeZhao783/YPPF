@@ -39,10 +39,10 @@ class ProfileLoggerRedactionTestCase(SimpleTestCase):
             self.assertIn("URL: /failing-view/", message)
             self.assertNotIn("auth=", message)
             self.assertIn("Method: POST", message)
+            self.assertIn("Except RuntimeError", message)
             for value in (*post_secrets, query_secret):
                 self.assertNotIn(value, message)
 
-        self.assertIn("RuntimeError", local_message)
         self.assertIn("exception details redacted", local_message)
 
     def test_secure_func_omits_argument_and_exception_values(self):

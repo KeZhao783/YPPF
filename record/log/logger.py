@@ -133,6 +133,8 @@ class Logger(logging.Logger):
             message = '\n'.join(msgs)
         exc_info = True
         if redact_exception is not None:
+            exception_type = type(redact_exception).__qualname__
+            message = f'Except {exception_type}\n{message}'
             exc_info = (
                 type(redact_exception),
                 Exception("exception details redacted"),
@@ -165,9 +167,8 @@ class Logger(logging.Logger):
     def _get_request_arg(self, request: HttpRequest, *args, **kwargs) -> HttpRequest:
         return request
 
-    def _traceback_msgs(self, exc_info: Exception, func: Callable) -> list[str]:
+    def _traceback_msgs(self, func: Callable) -> list[str]:
         msgs = []
-        msgs.append(f'Except {exc_info.__class__.__name__}')
         msgs.append(f'Function: {func.__module__}.{func.__qualname__}')
         return msgs
 
@@ -189,7 +190,7 @@ class Logger(logging.Logger):
                 request = self._get_request_arg(*args, **kwargs)
                 msgs.extend(self._request_msgs(request))
             else:
-                msgs.extend(self._traceback_msgs(exc, func))
+                msgs.extend(self._traceback_msgs(func))
                 msgs.extend(self._arg_msgs(args, kwargs))
             if message:
                 msgs.append(message)
