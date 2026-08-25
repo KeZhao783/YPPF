@@ -235,7 +235,7 @@ def send_password_reset_token(stu_id: str | int, token: str):
     message = (
         "您的账号正在重置密码\n本次请求的重置凭证为："
         f"<div class=\"highlight\">{token}</div>"
-        "凭证十分钟内有效，且只能使用一次。\n"
+        "凭证有效期较短，请尽快使用，且只能使用一次。\n"
         f"发送时间：{time}"
     )
     send_wechat(

@@ -755,7 +755,12 @@ class ForgetPasswordViewTests(TestCase):
         self.assertContains(response, 'name="token"')
         self.assertContains(response, 'name="new_password"')
         self.assertContains(response, 'name="confirm_password"')
+        self.assertContains(
+            response,
+            "凭证有效期较短，请尽快使用，且只能使用一次",
+        )
         self.assertNotContains(response, "验证码登录")
+        self.assertNotContains(response, "十分钟")
         self.assertFalse(models.PasswordResetChallenge.objects.exists())
         self.assertFalse(models.PasswordResetThrottle.objects.exists())
 
@@ -1145,6 +1150,11 @@ class PasswordResetDeliveryTests(TestCase):
         post_data = json.loads(post.call_args.args[1])
         self.assertEqual(post_data["toaddrs"], ["reset@example.com"])
         self.assertIn(token, post_data["content"])
+        self.assertIn(
+            "凭证有效期较短，请尽快使用，且只能使用一次",
+            post_data["content"],
+        )
+        self.assertNotIn("十分钟", post_data["content"])
         self.assertEqual(post.call_args.kwargs["timeout"], 6)
         post.return_value.raise_for_status.assert_called_once_with()
 
@@ -1231,6 +1241,11 @@ class PasswordResetDeliveryTests(TestCase):
         send_wechat.assert_called_once()
         args, kwargs = send_wechat.call_args
         self.assertIn(token, args[2])
+        self.assertIn(
+            "凭证有效期较短，请尽快使用，且只能使用一次",
+            args[2],
+        )
+        self.assertNotIn("十分钟", args[2])
         self.assertEqual(args[1], "YPPF密码重置")
         self.assertFalse(kwargs["multithread"])
         self.assertTrue(kwargs["raise_on_failure"])
