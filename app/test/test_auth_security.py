@@ -2,8 +2,15 @@ from urllib.parse import urlencode
 
 from django.conf import settings
 from django.middleware.csrf import get_token
+from django.shortcuts import render
 from django.template.loader import render_to_string
-from django.test import Client, RequestFactory, TestCase
+from django.test import (
+    Client,
+    RequestFactory,
+    TestCase,
+    override_settings,
+)
+from django.urls import include, path
 
 from app.models import (
     NaturalPerson,
@@ -15,6 +22,21 @@ from generic.models import User
 from utils.hasher import MyMD5Hasher
 
 
+def csrf_sidebar(request):
+    return render(
+        request,
+        "user_left_navbar.html",
+        {"bar_display": {}},
+    )
+
+
+urlpatterns = [
+    path("_test/csrf-sidebar/", csrf_sidebar),
+    path("", include("boot.urls")),
+]
+
+
+@override_settings(ROOT_URLCONF="app.test.test_auth_security")
 class LegacyMiniLoginRemovalTestCase(TestCase):
     @classmethod
     def setUpTestData(cls):
@@ -60,9 +82,10 @@ class LegacyMiniLoginRemovalTestCase(TestCase):
 
     def csrf_client(self):
         client = self.login_person(Client(enforce_csrf_checks=True))
-        request = RequestFactory().get("/")
-        token = get_token(request)
-        client.cookies[settings.CSRF_COOKIE_NAME] = request.META["CSRF_COOKIE"]
+        response = client.get("/_test/csrf-sidebar/")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(settings.CSRF_COOKIE_NAME, response.cookies)
+        token = client.cookies[settings.CSRF_COOKIE_NAME].value
         return client, token
 
     def render_sidebar(self, template_name, session):
@@ -93,7 +116,7 @@ class LegacyMiniLoginRemovalTestCase(TestCase):
     def test_login_redirects_only_to_safe_local_target(self):
         cases = (
             ("/inside?x=1", "/inside?x=1"),
-            ("http://testserver/inside", "http://testserver/inside"),
+            ("http://testserver/inside", "/welcome/"),
             ("//evil.example/phish", "/welcome/"),
             ("/\\evil.example/phish", "/welcome/"),
             ("https://evil.example/phish", "/welcome/"),
@@ -112,7 +135,7 @@ class LegacyMiniLoginRemovalTestCase(TestCase):
     def test_account_switch_redirects_only_to_safe_local_target(self):
         cases = (
             ("/inside", "/inside"),
-            ("http://testserver/inside", "http://testserver/inside"),
+            ("http://testserver/inside", "/welcome/"),
             ("//evil.example/phish", "/welcome/"),
             ("/\\evil.example/phish", "/welcome/"),
             ("https://evil.example/phish", "/welcome/"),

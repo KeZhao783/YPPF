@@ -42,15 +42,16 @@ def safe_local_redirect_target(
     if not isinstance(target, str):
         return fallback
     target = target.strip()
-    if not target or target.startswith("//") or "\\" in target:
+    if (
+        not target
+        or not target.startswith("/")
+        or target.startswith("//")
+        or "\\" in target
+    ):
         return fallback
-    if not target.startswith("/"):
-        scheme = parse.urlsplit(target).scheme.lower()
-        if scheme not in {"http", "https"}:
-            return fallback
     if not url_has_allowed_host_and_scheme(
         target,
-        allowed_hosts={request.get_host()},
+        allowed_hosts=set(),
         require_https=request.is_secure(),
     ):
         return fallback
