@@ -26,7 +26,7 @@ class ProfileLoggerRedactionTestCase(SimpleTestCase):
 
         @logger.secure_view()
         def failing_view(request):
-            raise RuntimeError("diagnostic-v13")
+            raise RuntimeError(request.POST["password"])
 
         with patch.object(logger, "_send_wechat") as send_wechat:
             with self.assertLogs(logger, level="ERROR") as captured:
@@ -41,3 +41,35 @@ class ProfileLoggerRedactionTestCase(SimpleTestCase):
             self.assertIn("Method: POST", message)
             for value in (*post_secrets, query_secret):
                 self.assertNotIn(value, message)
+
+        self.assertIn("RuntimeError", local_message)
+        self.assertIn("exception details redacted", local_message)
+
+    def test_secure_func_omits_argument_and_exception_values(self):
+        argument_secret = "feedback-v13-secret"
+        exception_secret = "exception-v13-secret"
+        request = RequestFactory().post(
+            "/feedback/",
+            {"content": argument_secret},
+        )
+        logger = ProfileLogger("v13-secure-func-test")
+        logger.setLevel(logging.DEBUG)
+        logger.set_debug_mode(False)
+
+        @logger.secure_func()
+        def failing_func(info, *, password):
+            raise RuntimeError(password)
+
+        with patch.object(logger, "_send_wechat") as send_wechat:
+            with self.assertLogs(logger, level="ERROR") as captured:
+                failing_func(request.POST, password=exception_secret)
+
+        local_message = "\n".join(captured.output)
+        wechat_message = send_wechat.call_args.args[0]
+        for message in (local_message, wechat_message):
+            self.assertNotIn(argument_secret, message)
+            self.assertNotIn(exception_secret, message)
+            self.assertIn("Arg types: QueryDict", message)
+            self.assertIn("Keyword names: password", message)
+            self.assertIn("Except RuntimeError", message)
+        self.assertIn("exception details redacted", local_message)

@@ -114,7 +114,8 @@ class Logger(logging.Logger):
 
     def on_exception(self, message: str = '', *,
                      request: HttpRequest | None = None,
-                     raise_exc: bool | None = None) -> None:
+                     raise_exc: bool | None = None,
+                     redact_exception: Exception | None = None) -> None:
         '''
         Log exception and raise it if needed.
 
@@ -122,13 +123,22 @@ class Logger(logging.Logger):
             message (str, optional): 基础日志信息. Defaults to ''.
             request (HttpRequest, optional): 记录请求信息. Defaults to None.
             raise_exc (bool, optional): 是否抛出异常，不提供则根据debug模式决定
+            redact_exception (Exception, optional): 保留异常类型和调用栈，
+                但不记录可能包含请求数据的异常消息。
         '''
         if request is not None:
             msgs = self._request_msgs(request)
             if message:
                 msgs.append(message)
             message = '\n'.join(msgs)
-        self.exception(message, stacklevel=2)
+        exc_info = True
+        if redact_exception is not None:
+            exc_info = (
+                type(redact_exception),
+                Exception("exception details redacted"),
+                redact_exception.__traceback__,
+            )
+        self.exception(message, exc_info=exc_info, stacklevel=2)
         if raise_exc is None:
             raise_exc = self.debug_mode
         if raise_exc:
@@ -157,14 +167,17 @@ class Logger(logging.Logger):
 
     def _traceback_msgs(self, exc_info: Exception, func: Callable) -> list[str]:
         msgs = []
-        msgs.append(f'Except {exc_info.__class__.__name__}: {exc_info}')
+        msgs.append(f'Except {exc_info.__class__.__name__}')
         msgs.append(f'Function: {func.__module__}.{func.__qualname__}')
         return msgs
 
     def _arg_msgs(self, args: tuple, kwargs: dict) -> list[str]:
         msgs = []
-        if args: msgs.append(f'Args: {args}')
-        if kwargs: msgs.append(f'Keywords: {kwargs}')
+        if args:
+            arg_types = ', '.join(type(arg).__qualname__ for arg in args)
+            msgs.append(f'Arg types: {arg_types}')
+        if kwargs:
+            msgs.append(f'Keyword names: {", ".join(kwargs)}')
         return msgs
 
     def listener(self, message: str = '', *,
@@ -180,5 +193,9 @@ class Logger(logging.Logger):
                 msgs.extend(self._arg_msgs(args, kwargs))
             if message:
                 msgs.append(message)
-            self.on_exception('\n'.join(msgs), raise_exc=raise_exc)
+            self.on_exception(
+                '\n'.join(msgs),
+                raise_exc=raise_exc,
+                redact_exception=exc,
+            )
         return _listener
