@@ -4,13 +4,17 @@ from rest_framework import viewsets
 from rest_framework.authentication import SessionAuthentication
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.decorators import action
-from rest_framework.exceptions import ValidationError
+from rest_framework.exceptions import NotFound, ValidationError
 from rest_framework.response import Response
 
 from questionnaire.models import *
 from questionnaire.serializers import *
 from questionnaire.permissions import *
-from questionnaire.utils import lock_draft_answersheet, submit_answersheet
+from questionnaire.utils import (
+    create_answersheet,
+    lock_draft_answersheet,
+    submit_answersheet,
+)
 
 
 # 用viewsets
@@ -81,6 +85,7 @@ class ChoiceViewSet(viewsets.ModelViewSet):
 
 
 class AnswerTextViewSet(viewsets.ModelViewSet):
+    queryset = AnswerText.objects.all()
     authentication_classes = [SessionAuthentication]
     permission_classes = [IsAuthenticated, IsTextOwnerOrAsker]
     serializer_class = AnswerTextSerializer
@@ -101,10 +106,6 @@ class AnswerTextViewSet(viewsets.ModelViewSet):
                 )
             )
         return texts.filter(answersheet__creator=self.request.user)
-
-    # debug时可以注释掉
-    def list(self, request, *args, **kwargs):
-        raise PermissionError("禁止直接查看所有答案！")
 
     def perform_create(self, serializer: AnswerTextSerializer):
         answersheet = serializer.validated_data['answersheet']
@@ -141,10 +142,18 @@ class AnswerTextViewSet(viewsets.ModelViewSet):
                 answersheet.pk,
                 self.request.user,
             )
+            try:
+                locked_answer = AnswerText.objects.select_for_update().get(
+                    pk=serializer.instance.pk,
+                    answersheet=locked_sheet,
+                )
+            except AnswerText.DoesNotExist as exc:
+                raise NotFound("答案不存在或已被删除！") from exc
             if locked_sheet.pk != validated_sheet.pk:
                 raise ValidationError("禁止修改答案所属答卷！")
-            if question.pk != validated_question.pk:
+            if locked_answer.question_id != validated_question.pk:
                 raise ValidationError("禁止修改答案所属问题！")
+            serializer.instance = locked_answer
             serializer.save(answersheet=locked_sheet)
 
     def perform_destroy(self, instance):
@@ -175,6 +184,7 @@ class AnswerTextViewSet(viewsets.ModelViewSet):
 
 
 class AnswerSheetViewSet(viewsets.ModelViewSet):
+    queryset = AnswerSheet.objects.all()
     authentication_classes = [SessionAuthentication]
     permission_classes = [IsAuthenticated, IsSheetOwnerOrAsker]
     serializer_class = AnswerSheetSerializer
@@ -192,19 +202,12 @@ class AnswerSheetViewSet(viewsets.ModelViewSet):
             )
         return sheets.filter(creator=self.request.user)
 
-    # debug时可以注释掉
-    def list(self, request, *args, **kwargs):
-        raise PermissionError("禁止直接查看所有答卷！")
-
     def perform_create(self, serializer: AnswerSheetSerializer):
-        creator = serializer.validated_data['creator']
         survey = serializer.validated_data['survey']
-        if survey.status != Survey.Status.PUBLISHED:  # 问卷必须处于发布状态才能创建答卷
-            raise PermissionError("只能创建已发布问卷的答案！")
-        elif AnswerSheet.objects.filter(creator=creator, survey=survey).exists():
-            raise PermissionError("禁止重复创建答卷！")
-        else:
-            serializer.save()
+        serializer.instance = create_answersheet(
+            survey.pk,
+            self.request.user,
+        )
 
     def perform_destroy(self, instance):
         with transaction.atomic():

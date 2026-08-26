@@ -1,7 +1,7 @@
 from datetime import datetime
 
 from django.core.exceptions import ValidationError as DjangoValidationError
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from rest_framework import serializers
 from rest_framework.exceptions import NotFound, PermissionDenied
 
@@ -9,14 +9,42 @@ from questionnaire.models import AnswerSheet, AnswerText, Survey
 from questionnaire.validators import validate_answer_body
 
 __all__ = [
+    'create_answersheet',
     'lock_draft_answersheet',
     'submit_answersheet',
 ]
 
 
+def create_answersheet(survey_id, actor):
+    """Atomically create the actor's only draft sheet for a survey."""
+    with transaction.atomic():
+        try:
+            survey = Survey.objects.select_for_update().get(pk=survey_id)
+        except Survey.DoesNotExist as exc:
+            raise NotFound("问卷不存在或已被删除！") from exc
+        if survey.status != Survey.Status.PUBLISHED:
+            raise serializers.ValidationError("只能创建已发布问卷的答卷！")
+        if AnswerSheet.objects.filter(
+            creator_id=actor.pk,
+            survey=survey,
+        ).exists():
+            raise serializers.ValidationError("禁止重复创建答卷！")
+        try:
+            with transaction.atomic():
+                return AnswerSheet.objects.create(
+                    creator=actor,
+                    survey=survey,
+                )
+        except IntegrityError as exc:
+            raise serializers.ValidationError("禁止重复创建答卷！") from exc
+
+
 def lock_draft_answersheet(sheet_id, actor):
     """Lock a sheet row and require it still be a draft owned by actor."""
-    sheet = AnswerSheet.objects.select_for_update().get(pk=sheet_id)
+    try:
+        sheet = AnswerSheet.objects.select_for_update().get(pk=sheet_id)
+    except AnswerSheet.DoesNotExist as exc:
+        raise NotFound("答卷不存在或已被删除！") from exc
     if sheet.creator_id != actor.pk:
         raise PermissionDenied("只有答卷创建者才能修改答卷！")
     if sheet.status != AnswerSheet.Status.DRAFT:

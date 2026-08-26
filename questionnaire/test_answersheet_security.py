@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta
 from threading import Event, Thread
 
-from django.db import close_old_connections, connection
+from django.db import IntegrityError, close_old_connections, connection, transaction
 from django.test import TestCase, TransactionTestCase
 from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
@@ -51,16 +51,30 @@ class AnswerSheetApiSecurityTests(TestCase):
             start_time=now - timedelta(days=1),
             end_time=now + timedelta(days=1),
         )
+        cls.put_survey = Survey.objects.create(
+            title="V10 API PUT boundary survey",
+            creator=cls.asker,
+            status=Survey.Status.PUBLISHED,
+            start_time=now - timedelta(days=1),
+            end_time=now + timedelta(days=1),
+        )
+        cls.submitted_survey = Survey.objects.create(
+            title="V10 API submitted boundary survey",
+            creator=cls.asker,
+            status=Survey.Status.PUBLISHED,
+            start_time=now - timedelta(days=1),
+            end_time=now + timedelta(days=1),
+        )
         cls.draft = AnswerSheet.objects.create(
             survey=cls.survey,
             creator=cls.respondent,
         )
         cls.put_draft = AnswerSheet.objects.create(
-            survey=cls.survey,
+            survey=cls.put_survey,
             creator=cls.respondent,
         )
         cls.submitted = AnswerSheet.objects.create(
-            survey=cls.survey,
+            survey=cls.submitted_survey,
             creator=cls.respondent,
             status=AnswerSheet.Status.SUBMITTED,
         )
@@ -74,7 +88,7 @@ class AnswerSheetApiSecurityTests(TestCase):
         patch_response = self.client.patch(
             reverse("answersheet-detail", args=[self.draft.pk]),
             {
-                "survey": self.survey.pk,
+                "survey": self.put_survey.pk,
                 "status": AnswerSheet.Status.SUBMITTED,
             },
             format="json",
@@ -119,6 +133,30 @@ class AnswerSheetApiSecurityTests(TestCase):
         self.assertEqual(created.creator, self.unrelated)
         self.assertEqual(created.status, AnswerSheet.Status.DRAFT)
 
+    def test_duplicate_sheet_is_rejected_by_api_and_database(self):
+        self.client.force_login(self.respondent)
+
+        response = self.client.post(
+            reverse("answersheet-list"),
+            {"survey": self.survey.pk},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(
+            AnswerSheet.objects.filter(
+                creator=self.respondent,
+                survey=self.survey,
+            ).count(),
+            1,
+        )
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                AnswerSheet.objects.create(
+                    creator=self.respondent,
+                    survey=self.survey,
+                )
+
     def test_survey_owner_lists_only_submitted_sheets(self):
         self.client.force_login(self.asker)
 
@@ -155,6 +193,13 @@ class AnswerSheetApiSecurityTests(TestCase):
 
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
+    def test_direct_sheet_list_is_rejected_at_request_level(self):
+        self.client.force_login(self.respondent)
+
+        response = self.client.get(reverse("answersheet-list"))
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
     def test_owner_can_delete_draft_sheet(self):
         question = Question.objects.create(
             survey=self.survey,
@@ -163,10 +208,7 @@ class AnswerSheetApiSecurityTests(TestCase):
             type=Question.Type.TEXT,
             required=False,
         )
-        sheet = AnswerSheet.objects.create(
-            survey=self.survey,
-            creator=self.respondent,
-        )
+        sheet = self.draft
         answer = AnswerText.objects.create(
             question=question,
             answersheet=sheet,
@@ -183,7 +225,7 @@ class AnswerSheetApiSecurityTests(TestCase):
 
     def test_submitted_sheet_rejects_delete(self):
         question = Question.objects.create(
-            survey=self.survey,
+            survey=self.submitted_survey,
             order=100,
             topic="Submitted delete target",
             type=Question.Type.TEXT,
@@ -272,6 +314,12 @@ class AnswerSheetSubmitTests(TestCase):
             password="test-password",
             is_staff=True,
         )
+        cls.organization_account = User.objects.create_user(
+            username="v10_submit_org",
+            name="V10 Submit Organization",
+            password="test-password",
+            utype=User.Type.ORG,
+        )
         cls.now = datetime.now()
         cls.survey = Survey.objects.create(
             title="V10 submit survey",
@@ -308,13 +356,27 @@ class AnswerSheetSubmitTests(TestCase):
             answersheet=cls.draft,
             body="complete",
         )
+        cls.submitted_survey = Survey.objects.create(
+            title="V10 already submitted survey",
+            creator=cls.asker,
+            status=Survey.Status.PUBLISHED,
+            start_time=cls.now - timedelta(days=1),
+            end_time=cls.now + timedelta(days=1),
+        )
+        cls.submitted_question = Question.objects.create(
+            survey=cls.submitted_survey,
+            order=1,
+            topic="Already submitted required text",
+            type=Question.Type.TEXT,
+            required=True,
+        )
         cls.submitted = AnswerSheet.objects.create(
-            survey=cls.survey,
+            survey=cls.submitted_survey,
             creator=cls.respondent,
             status=AnswerSheet.Status.SUBMITTED,
         )
         AnswerText.objects.create(
-            question=cls.required_question,
+            question=cls.submitted_question,
             answersheet=cls.submitted,
             body="already submitted",
         )
@@ -348,7 +410,12 @@ class AnswerSheetSubmitTests(TestCase):
         self.assertEqual(response.data["status"], AnswerSheet.Status.SUBMITTED)
 
     def test_nonowners_cannot_submit_respondent_draft(self):
-        for actor in (self.asker, self.unrelated, self.staff):
+        for actor in (
+            self.asker,
+            self.unrelated,
+            self.staff,
+            self.organization_account,
+        ):
             with self.subTest(actor=actor.username):
                 self.client.force_login(actor)
 
@@ -619,12 +686,32 @@ class AnswerTextSecurityTests(TestCase):
             type=Question.Type.TEXT,
             required=False,
         )
+        cls.submitted_survey = Survey.objects.create(
+            title="V10 submitted answer text survey",
+            creator=cls.asker,
+            status=Survey.Status.PUBLISHED,
+            start_time=now - timedelta(days=1),
+            end_time=now + timedelta(days=1),
+        )
+        cls.submitted_primary_question = Question.objects.create(
+            survey=cls.submitted_survey,
+            order=1,
+            topic="Submitted primary text",
+            type=Question.Type.TEXT,
+        )
+        cls.submitted_optional_question = Question.objects.create(
+            survey=cls.submitted_survey,
+            order=2,
+            topic="Submitted optional text",
+            type=Question.Type.TEXT,
+            required=False,
+        )
         cls.draft = AnswerSheet.objects.create(
             survey=cls.survey,
             creator=cls.respondent,
         )
         cls.submitted = AnswerSheet.objects.create(
-            survey=cls.survey,
+            survey=cls.submitted_survey,
             creator=cls.respondent,
             status=AnswerSheet.Status.SUBMITTED,
         )
@@ -634,7 +721,7 @@ class AnswerTextSecurityTests(TestCase):
             body="draft body",
         )
         cls.submitted_answer = AnswerText.objects.create(
-            question=cls.primary_question,
+            question=cls.submitted_primary_question,
             answersheet=cls.submitted,
             body="submitted body",
         )
@@ -686,7 +773,7 @@ class AnswerTextSecurityTests(TestCase):
         response = self.client.post(
             reverse("answertext-list"),
             {
-                "question": self.optional_question.pk,
+                "question": self.submitted_optional_question.pk,
                 "answersheet": self.submitted.pk,
                 "body": "late answer",
             },
@@ -695,7 +782,7 @@ class AnswerTextSecurityTests(TestCase):
 
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
         self.assertFalse(AnswerText.objects.filter(
-            question=self.optional_question,
+            question=self.submitted_optional_question,
             answersheet=self.submitted,
         ).exists())
 
@@ -845,6 +932,13 @@ class AnswerTextSecurityTests(TestCase):
 
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
+    def test_direct_answer_list_is_rejected_at_request_level(self):
+        self.client.force_login(self.respondent)
+
+        response = self.client.get(reverse("answertext-list"))
+
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
     def test_answer_owner_reads_own_draft_and_submitted_answers(self):
         self.client.force_login(self.respondent)
 
@@ -915,6 +1009,78 @@ class AnswerSheetConcurrencyTests(TransactionTestCase):
             and "QUESTIONNAIRE_ANSWERSHEET" in normalized
             and "FOR UPDATE" not in normalized
         )
+
+    @staticmethod
+    def _is_unlocked_answer_read(sql):
+        normalized = " ".join(sql.upper().split())
+        return (
+            normalized.startswith("SELECT")
+            and "QUESTIONNAIRE_ANSWERTEXT" in normalized
+            and "FOR UPDATE" not in normalized
+        )
+
+    @staticmethod
+    def _is_survey_lock(sql):
+        normalized = " ".join(sql.upper().split())
+        return (
+            "FOR UPDATE" in normalized
+            and "QUESTIONNAIRE_SURVEY" in normalized
+        )
+
+    def _start_paused_answer_patch(self, data):
+        answer_read = Event()
+        allow_patch = Event()
+        results = {}
+        errors = []
+        paused = {"value": False}
+
+        def pause_after_initial_read(execute, sql, params, many, context):
+            result = execute(sql, params, many, context)
+            if (
+                not paused["value"]
+                and self._is_unlocked_answer_read(sql)
+            ):
+                paused["value"] = True
+                answer_read.set()
+                if not allow_patch.wait(10):
+                    raise TimeoutError("answer PATCH was not released by test")
+            return result
+
+        def patch_worker():
+            close_old_connections()
+            client = APIClient()
+            client.force_authenticate(user=self.respondent)
+            try:
+                with connection.execute_wrapper(pause_after_initial_read):
+                    response = client.patch(
+                        reverse(
+                            "answertext-detail",
+                            args=[self.required_answer.pk],
+                        ),
+                        data,
+                        format="json",
+                    )
+                results["status"] = response.status_code
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                close_old_connections()
+
+        thread = Thread(target=patch_worker)
+        thread.start()
+        if not answer_read.wait(10):
+            allow_patch.set()
+            thread.join(10)
+            self.fail("PATCH did not perform its initial unlocked answer read")
+        return thread, allow_patch, results, errors
+
+    def _finish_paused_request(self, thread, release, results, errors):
+        release.set()
+        thread.join(10)
+        self.assertFalse(thread.is_alive(), "paused request did not finish")
+        if errors:
+            raise errors[0]
+        return results["status"]
 
     def _race_submit_against_mutation(self, method, path, data=None):
         submit_has_lock = Event()
@@ -1065,6 +1231,176 @@ class AnswerSheetConcurrencyTests(TransactionTestCase):
             AnswerText.objects.filter(pk=self.required_answer.pk).exists())
         self.sheet.refresh_from_db()
         self.assertEqual(self.sheet.status, AnswerSheet.Status.SUBMITTED)
+
+    def test_concurrent_submit_only_one_succeeds(self):
+        self._race_submit_against_mutation(
+            "post",
+            reverse("answersheet-submit", args=[self.sheet.pk]),
+        )
+
+    def test_empty_patch_after_update_preserves_committed_body(self):
+        thread, release, results, errors = self._start_paused_answer_patch({})
+        client = APIClient()
+        client.force_authenticate(user=self.respondent)
+
+        update_response = client.patch(
+            reverse(
+                "answertext-detail",
+                args=[self.required_answer.pk],
+            ),
+            {"body": "new committed body"},
+            format="json",
+        )
+        paused_status = self._finish_paused_request(
+            thread,
+            release,
+            results,
+            errors,
+        )
+
+        self.assertEqual(update_response.status_code, status.HTTP_200_OK)
+        self.assertEqual(paused_status, status.HTTP_200_OK)
+        self.required_answer.refresh_from_db()
+        self.assertEqual(self.required_answer.body, "new committed body")
+
+    def test_deleted_answer_is_not_resurrected_by_waiting_patch(self):
+        thread, release, results, errors = self._start_paused_answer_patch(
+            {"body": "must not be resurrected"},
+        )
+        client = APIClient()
+        client.force_authenticate(user=self.respondent)
+
+        delete_response = client.delete(reverse(
+            "answertext-detail",
+            args=[self.required_answer.pk],
+        ))
+        paused_status = self._finish_paused_request(
+            thread,
+            release,
+            results,
+            errors,
+        )
+
+        self.assertEqual(delete_response.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertEqual(paused_status, status.HTTP_404_NOT_FOUND)
+        self.assertFalse(
+            AnswerText.objects.filter(pk=self.required_answer.pk).exists())
+
+    def test_deleted_sheet_returns_404_to_waiting_answer_patch(self):
+        thread, release, results, errors = self._start_paused_answer_patch(
+            {"body": "must not survive sheet deletion"},
+        )
+        client = APIClient()
+        client.force_authenticate(user=self.respondent)
+
+        delete_response = client.delete(reverse(
+            "answersheet-detail",
+            args=[self.sheet.pk],
+        ))
+        paused_status = self._finish_paused_request(
+            thread,
+            release,
+            results,
+            errors,
+        )
+
+        self.assertEqual(delete_response.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertEqual(paused_status, status.HTTP_404_NOT_FOUND)
+        self.assertFalse(AnswerSheet.objects.filter(pk=self.sheet.pk).exists())
+        self.assertFalse(
+            AnswerText.objects.filter(pk=self.required_answer.pk).exists())
+
+    def test_concurrent_sheet_creates_produce_one_draft(self):
+        respondent = User.objects.create_user(
+            username="v10_race_create_respondent",
+            name="V10 Race Create Respondent",
+        )
+        first_has_lock = Event()
+        allow_first = Event()
+        second_attempted_lock = Event()
+        second_done = Event()
+        results = []
+        errors = []
+        first_paused = {"value": False}
+        second_signaled = {"value": False}
+
+        def pause_first_after_lock(execute, sql, params, many, context):
+            result = execute(sql, params, many, context)
+            if not first_paused["value"] and self._is_survey_lock(sql):
+                first_paused["value"] = True
+                first_has_lock.set()
+                if not allow_first.wait(10):
+                    raise TimeoutError("first create was not released by test")
+            return result
+
+        def signal_second_lock(execute, sql, params, many, context):
+            if not second_signaled["value"] and self._is_survey_lock(sql):
+                second_signaled["value"] = True
+                second_attempted_lock.set()
+            return execute(sql, params, many, context)
+
+        def create_worker(wrapper, is_second=False):
+            close_old_connections()
+            client = APIClient()
+            client.force_authenticate(user=respondent)
+            try:
+                with connection.execute_wrapper(wrapper):
+                    response = client.post(
+                        reverse("answersheet-list"),
+                        {"survey": self.survey.pk},
+                        format="json",
+                    )
+                results.append(response.status_code)
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                if is_second:
+                    second_done.set()
+                close_old_connections()
+
+        first_thread = Thread(target=create_worker, args=(pause_first_after_lock,))
+        second_thread = Thread(
+            target=create_worker,
+            args=(signal_second_lock, True),
+        )
+        first_thread.start()
+        second_started = False
+        try:
+            self.assertTrue(
+                first_has_lock.wait(10),
+                "first create did not lock the survey row",
+            )
+            second_thread.start()
+            second_started = True
+            self.assertTrue(
+                second_attempted_lock.wait(10),
+                "second create did not attempt the survey lock",
+            )
+            self.assertFalse(
+                second_done.wait(0.25),
+                "second create completed while the first held the lock",
+            )
+        finally:
+            allow_first.set()
+            first_thread.join(10)
+            if second_started:
+                second_thread.join(10)
+
+        self.assertFalse(first_thread.is_alive())
+        self.assertFalse(second_thread.is_alive())
+        if errors:
+            raise errors[0]
+        self.assertEqual(
+            sorted(results),
+            [status.HTTP_201_CREATED, status.HTTP_400_BAD_REQUEST],
+        )
+        self.assertEqual(
+            AnswerSheet.objects.filter(
+                creator=respondent,
+                survey=self.survey,
+            ).count(),
+            1,
+        )
 
     def test_sheet_delete_wins_race_against_submit(self):
         submit_read_sheet = Event()

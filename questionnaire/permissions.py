@@ -11,6 +11,20 @@ __all__ = [
 ]
 
 class IsTextOwnerOrAsker(permissions.BasePermission):
+    allowed_actions = {
+        'answer_owner',
+        'create',
+        'destroy',
+        'metadata',
+        'partial_update',
+        'retrieve',
+        'survey_owner',
+        'update',
+    }
+
+    def has_permission(self, request, view):
+        return view.action in self.allowed_actions
+
     def has_object_permission(self, request, view, obj):
         sheet = obj.answersheet
         if request.user == sheet.creator:
@@ -26,6 +40,21 @@ class IsTextOwnerOrAsker(permissions.BasePermission):
 
 
 class IsSheetOwnerOrAsker(permissions.BasePermission):
+    allowed_actions = {
+        'answer_owner',
+        'create',
+        'destroy',
+        'metadata',
+        'partial_update',
+        'retrieve',
+        'submit',
+        'survey_owner',
+        'update',
+    }
+
+    def has_permission(self, request, view):
+        return view.action in self.allowed_actions
+
     def has_object_permission(self, request, view, obj):
         if request.user == obj.creator:
             if (

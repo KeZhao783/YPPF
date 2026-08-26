@@ -1,4 +1,9 @@
+from django.core.exceptions import ValidationError
 from django.db import transaction
+from django.http import HttpResponse
+from django.utils.decorators import method_decorator
+from django.views.decorators.csrf import csrf_protect
+from openpyxl import Workbook
 from rest_framework import viewsets
 from rest_framework.exceptions import ValidationError as DRFValidationError
 
@@ -13,11 +18,8 @@ from dormitory.serializers import (
     DormitoryAssignmentSerializer, DormitorySerializer,
     AgreementSerializerFixme, AgreementSerializer)
 from questionnaire.models import AnswerSheet, AnswerText, Question, Survey
-from questionnaire.utils import submit_answersheet
+from questionnaire.utils import create_answersheet, submit_answersheet
 from questionnaire.validators import validate_answer_body
-from django.core.exceptions import ValidationError
-from django.http import HttpResponse
-from openpyxl import Workbook
 
 class DormitoryViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = Dormitory.objects.all()
@@ -49,6 +51,7 @@ class DormitoryAgreementViewSet(viewsets.ReadOnlyModelViewSet):
     serializer_class = AgreementSerializer
 
 
+@method_decorator(csrf_protect, name='dispatch')
 class DormitoryRoutineQAView(ProfileTemplateView):
 
     template_name = 'dormitory/routine_QA.html'
@@ -88,8 +91,6 @@ class DormitoryRoutineQAView(ProfileTemplateView):
 
     def post(self):
         survey = self.get_survey()
-        assert not AnswerSheet.objects.filter(creator=self.request.user,
-                                              survey=survey).exists()
 
         # Collect submitted answers for repopulation on validation failure
         submitted = {
@@ -153,10 +154,18 @@ class DormitoryRoutineQAView(ProfileTemplateView):
                     **render_kwargs,
                 )
 
+        if survey.status != Survey.Status.PUBLISHED:
+            return self.render(
+                html_display=dict(
+                    warn_code=1,
+                    warn_message='只能提交已发布的问卷！',
+                ),
+                **render_kwargs,
+            )
+
         try:
             with transaction.atomic():
-                sheet = AnswerSheet.objects.create(creator=self.request.user,
-                                                   survey=survey)
+                sheet = create_answersheet(survey.pk, self.request.user)
                 for question in survey.questions.order_by('order'):
                     answer = submitted[str(question.order)]
                     if not answer:
