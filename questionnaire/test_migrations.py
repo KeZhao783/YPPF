@@ -90,22 +90,26 @@ class AnswerSheetMigrationTests(TransactionTestCase):
                     survey=self.survey,
                 )
 
-    def test_complete_legacy_sheets_are_backfilled_without_promoting_drafts(
+    def test_only_legacy_dormitory_submissions_are_backfilled(
         self,
     ):
-        self.Survey.objects.filter(pk=self.survey.pk).update(
+        legacy_survey = self.Survey.objects.create(
+            title='宿舍生活习惯调研-2025',
+            description='根据问卷情况对宿舍进行分配',
+            creator=self.creator,
             status=2,
+            start_time=datetime.now() - timedelta(days=2),
             end_time=datetime.now() - timedelta(days=1),
         )
         required_question = self.Question.objects.create(
-            survey=self.survey,
+            survey=legacy_survey,
             order=1,
             topic='Required question',
             type='TEXT',
             required=True,
         )
         optional_question = self.Question.objects.create(
-            survey=self.survey,
+            survey=legacy_survey,
             order=2,
             topic='Optional question',
             type='TEXT',
@@ -113,7 +117,7 @@ class AnswerSheetMigrationTests(TransactionTestCase):
         )
         completed_sheet = self.AnswerSheet.objects.create(
             creator=self.respondent,
-            survey=self.survey,
+            survey=legacy_survey,
         )
         self.AnswerText.objects.create(
             answersheet=completed_sheet,
@@ -127,7 +131,7 @@ class AnswerSheetMigrationTests(TransactionTestCase):
         )
         partial_sheet = self.AnswerSheet.objects.create(
             creator=partial_user,
-            survey=self.survey,
+            survey=legacy_survey,
         )
         self.AnswerText.objects.create(
             answersheet=partial_sheet,
@@ -141,7 +145,57 @@ class AnswerSheetMigrationTests(TransactionTestCase):
         )
         empty_sheet = self.AnswerSheet.objects.create(
             creator=empty_user,
+            survey=legacy_survey,
+        )
+
+        generic_required_question = self.Question.objects.create(
             survey=self.survey,
+            order=1,
+            topic='Generic required question',
+            type='TEXT',
+            required=True,
+        )
+        generic_draft_user = self.User.objects.create_user(
+            username='v10_migration_generic_draft',
+            name='Migration Generic Draft',
+        )
+        generic_completed_draft = self.AnswerSheet.objects.create(
+            creator=generic_draft_user,
+            survey=self.survey,
+        )
+        self.AnswerText.objects.create(
+            answersheet=generic_completed_draft,
+            question=generic_required_question,
+            body='complete but intentionally still a draft',
+        )
+
+        lookalike_survey = self.Survey.objects.create(
+            title='宿舍生活习惯调研-2025',
+            description='Unrelated survey using a similar title',
+            creator=self.creator,
+            status=1,
+            start_time=datetime.now() - timedelta(days=1),
+            end_time=datetime.now() + timedelta(days=1),
+        )
+        lookalike_question = self.Question.objects.create(
+            survey=lookalike_survey,
+            order=1,
+            topic='Lookalike required question',
+            type='TEXT',
+            required=True,
+        )
+        lookalike_user = self.User.objects.create_user(
+            username='v10_migration_lookalike_draft',
+            name='Migration Lookalike Draft',
+        )
+        lookalike_draft = self.AnswerSheet.objects.create(
+            creator=lookalike_user,
+            survey=lookalike_survey,
+        )
+        self.AnswerText.objects.create(
+            answersheet=lookalike_draft,
+            question=lookalike_question,
+            body='also complete but intentionally still a draft',
         )
 
         executor = MigrationExecutor(connection)
@@ -164,5 +218,15 @@ class AnswerSheetMigrationTests(TransactionTestCase):
         )
         self.assertEqual(
             MigratedAnswerSheet.objects.get(pk=empty_sheet.pk).status,
+            0,
+        )
+        self.assertEqual(
+            MigratedAnswerSheet.objects.get(
+                pk=generic_completed_draft.pk,
+            ).status,
+            0,
+        )
+        self.assertEqual(
+            MigratedAnswerSheet.objects.get(pk=lookalike_draft.pk).status,
             0,
         )
