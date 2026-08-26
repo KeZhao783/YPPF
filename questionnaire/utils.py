@@ -5,7 +5,7 @@ from django.db import IntegrityError, transaction
 from rest_framework import serializers
 from rest_framework.exceptions import NotFound, PermissionDenied
 
-from questionnaire.models import AnswerSheet, AnswerText, Survey
+from questionnaire.models import AnswerSheet, AnswerText, Question, Survey
 from questionnaire.validators import validate_answer_body
 
 __all__ = [
@@ -56,15 +56,16 @@ def lock_draft_answersheet(sheet_id, actor):
 
 
 def submit_answersheet(sheet_id, actor, now=None):
-    now = datetime.now() if now is None else now
+    """Validate and submit an actor-owned draft in one transaction.
+
+    The respondent-specific sheet is locked for the full validation. The
+    shared survey row is locked only for the final status and time-window
+    checks so survey changes serialize with submission without making answer
+    validation for unrelated respondents run serially.
+    """
     with transaction.atomic():
         try:
-            sheet = (
-                AnswerSheet.objects
-                .select_for_update()
-                .select_related('survey')
-                .get(pk=sheet_id)
-            )
+            sheet = AnswerSheet.objects.select_for_update().get(pk=sheet_id)
         except AnswerSheet.DoesNotExist as exc:
             raise NotFound("答卷不存在或已被删除！") from exc
         if sheet.creator_id != actor.pk:
@@ -72,14 +73,12 @@ def submit_answersheet(sheet_id, actor, now=None):
         if sheet.status != AnswerSheet.Status.DRAFT:
             raise serializers.ValidationError("答卷已经提交！")
 
-        survey = sheet.survey
-        if survey.status != Survey.Status.PUBLISHED:
-            raise serializers.ValidationError("只能提交已发布的问卷！")
-        if not survey.start_time <= now <= survey.end_time:
-            raise serializers.ValidationError("当前不在问卷提交时间内！")
-
         questions = list(
-            survey.questions.prefetch_related('choices').order_by('order'))
+            Question.objects
+            .filter(survey_id=sheet.survey_id)
+            .prefetch_related('choices')
+            .order_by('order')
+        )
         question_by_id = {
             question.pk: question
             for question in questions
@@ -120,6 +119,18 @@ def submit_answersheet(sheet_id, actor, now=None):
             for question in questions
         ):
             raise serializers.ValidationError("必填题尚未完成！")
+
+        try:
+            survey = Survey.objects.select_for_update().get(
+                pk=sheet.survey_id,
+            )
+        except Survey.DoesNotExist as exc:
+            raise NotFound("问卷不存在或已被删除！") from exc
+        effective_now = datetime.now() if now is None else now
+        if survey.status != Survey.Status.PUBLISHED:
+            raise serializers.ValidationError("只能提交已发布的问卷！")
+        if not survey.start_time <= effective_now <= survey.end_time:
+            raise serializers.ValidationError("当前不在问卷提交时间内！")
 
         sheet.status = AnswerSheet.Status.SUBMITTED
         sheet.save(update_fields=['status'])

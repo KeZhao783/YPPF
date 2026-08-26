@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta
 from threading import Event, Thread
+from unittest.mock import patch
 
 from django.db import IntegrityError, close_old_connections, connection, transaction
 from django.test import TestCase, TransactionTestCase
@@ -1229,6 +1230,137 @@ class AnswerSheetConcurrencyTests(TransactionTestCase):
             "post",
             reverse("answersheet-submit", args=[self.sheet.pk]),
         )
+
+    def test_waiting_submit_captures_default_time_after_sheet_lock(self):
+        deadline = datetime(2030, 8, 26, 12, 0, 0)
+        self.survey.start_time = deadline - timedelta(days=1)
+        self.survey.end_time = deadline
+        self.survey.save(update_fields=['start_time', 'end_time'])
+        lock_attempted = Event()
+        deadline_passed = Event()
+        now_called = Event()
+        results = {}
+        errors = []
+        lock_signaled = {"value": False}
+
+        def fake_now():
+            now_called.set()
+            if deadline_passed.is_set():
+                return deadline + timedelta(seconds=1)
+            return deadline - timedelta(seconds=1)
+
+        def signal_sheet_lock(execute, sql, params, many, context):
+            if not lock_signaled["value"] and self._is_sheet_lock(sql):
+                lock_signaled["value"] = True
+                lock_attempted.set()
+            return execute(sql, params, many, context)
+
+        def submit_worker():
+            close_old_connections()
+            client = APIClient()
+            client.force_authenticate(user=self.respondent)
+            try:
+                with patch('questionnaire.utils.datetime') as mock_datetime:
+                    mock_datetime.now.side_effect = fake_now
+                    with connection.execute_wrapper(signal_sheet_lock):
+                        response = client.post(
+                            reverse(
+                                "answersheet-submit",
+                                args=[self.sheet.pk],
+                            ),
+                            {},
+                            format="json",
+                        )
+                results["status"] = response.status_code
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                close_old_connections()
+
+        lock_observed = False
+        called_before_lock = False
+        with transaction.atomic():
+            AnswerSheet.objects.select_for_update().get(pk=self.sheet.pk)
+            submit_thread = Thread(target=submit_worker)
+            submit_thread.start()
+            try:
+                lock_observed = lock_attempted.wait(10)
+                called_before_lock = now_called.is_set()
+            finally:
+                deadline_passed.set()
+
+        submit_thread.join(10)
+        self.assertTrue(
+            lock_observed,
+            "submit did not attempt the answer-sheet row lock",
+        )
+        self.assertFalse(submit_thread.is_alive())
+        if errors:
+            raise errors[0]
+        self.assertFalse(
+            called_before_lock,
+            "submit captured the deadline timestamp before acquiring the lock",
+        )
+        self.assertEqual(results["status"], status.HTTP_400_BAD_REQUEST)
+        self.sheet.refresh_from_db()
+        self.assertEqual(self.sheet.status, AnswerSheet.Status.DRAFT)
+
+    def test_submit_reloads_survey_state_after_answer_validation(self):
+        answer_read = Event()
+        allow_submit = Event()
+        results = {}
+        errors = []
+        paused = {"value": False}
+
+        def pause_after_answer_read(execute, sql, params, many, context):
+            result = execute(sql, params, many, context)
+            if not paused["value"] and self._is_unlocked_answer_read(sql):
+                paused["value"] = True
+                answer_read.set()
+                if not allow_submit.wait(10):
+                    raise TimeoutError("submit was not released by test")
+            return result
+
+        def submit_worker():
+            close_old_connections()
+            client = APIClient()
+            client.force_authenticate(user=self.respondent)
+            try:
+                with connection.execute_wrapper(pause_after_answer_read):
+                    response = client.post(
+                        reverse(
+                            "answersheet-submit",
+                            args=[self.sheet.pk],
+                        ),
+                        {},
+                        format="json",
+                    )
+                results["status"] = response.status_code
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                close_old_connections()
+
+        submit_thread = Thread(target=submit_worker)
+        submit_thread.start()
+        try:
+            self.assertTrue(
+                answer_read.wait(10),
+                "submit did not read answers before the survey state check",
+            )
+            Survey.objects.filter(pk=self.survey.pk).update(
+                status=Survey.Status.ENDED,
+            )
+        finally:
+            allow_submit.set()
+            submit_thread.join(10)
+
+        self.assertFalse(submit_thread.is_alive())
+        if errors:
+            raise errors[0]
+        self.assertEqual(results["status"], status.HTTP_400_BAD_REQUEST)
+        self.sheet.refresh_from_db()
+        self.assertEqual(self.sheet.status, AnswerSheet.Status.DRAFT)
 
     def test_empty_patch_after_update_preserves_committed_body(self):
         thread, release, results, errors = self._start_paused_answer_patch({})
