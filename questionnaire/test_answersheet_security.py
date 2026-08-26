@@ -5,7 +5,7 @@ from django.db import IntegrityError, close_old_connections, connection, transac
 from django.test import TestCase, TransactionTestCase
 from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
-from rest_framework import status
+from rest_framework import serializers, status
 from rest_framework.test import APIClient
 
 from generic.models import User
@@ -16,7 +16,7 @@ from questionnaire.models import (
     Question,
     Survey,
 )
-from questionnaire.utils import submit_answersheet
+from questionnaire.utils import create_answersheet, submit_answersheet
 
 
 class AnswerSheetApiSecurityTests(TestCase):
@@ -1019,14 +1019,6 @@ class AnswerSheetConcurrencyTests(TransactionTestCase):
             and "FOR UPDATE" not in normalized
         )
 
-    @staticmethod
-    def _is_survey_lock(sql):
-        normalized = " ".join(sql.upper().split())
-        return (
-            "FOR UPDATE" in normalized
-            and "QUESTIONNAIRE_SURVEY" in normalized
-        )
-
     def _start_paused_answer_patch(self, data):
         answer_read = Event()
         allow_patch = Event()
@@ -1310,90 +1302,143 @@ class AnswerSheetConcurrencyTests(TransactionTestCase):
         self.assertFalse(
             AnswerText.objects.filter(pk=self.required_answer.pk).exists())
 
-    def test_concurrent_sheet_creates_produce_one_draft(self):
-        respondent = User.objects.create_user(
-            username="v10_race_create_respondent",
-            name="V10 Race Create Respondent",
-        )
-        first_has_lock = Event()
-        allow_first = Event()
-        second_attempted_lock = Event()
-        second_done = Event()
-        results = []
-        errors = []
-        first_paused = {"value": False}
-        second_signaled = {"value": False}
+    def _start_paused_sheet_create(self, actor, result_key, results, errors):
+        created = Event()
+        release = Event()
 
-        def pause_first_after_lock(execute, sql, params, many, context):
-            result = execute(sql, params, many, context)
-            if not first_paused["value"] and self._is_survey_lock(sql):
-                first_paused["value"] = True
-                first_has_lock.set()
-                if not allow_first.wait(10):
-                    raise TimeoutError("first create was not released by test")
-            return result
-
-        def signal_second_lock(execute, sql, params, many, context):
-            if not second_signaled["value"] and self._is_survey_lock(sql):
-                second_signaled["value"] = True
-                second_attempted_lock.set()
-            return execute(sql, params, many, context)
-
-        def create_worker(wrapper, is_second=False):
+        def create_worker():
             close_old_connections()
-            client = APIClient()
-            client.force_authenticate(user=respondent)
             try:
-                with connection.execute_wrapper(wrapper):
-                    response = client.post(
-                        reverse("answersheet-list"),
-                        {"survey": self.survey.pk},
-                        format="json",
-                    )
-                results.append(response.status_code)
+                with transaction.atomic():
+                    sheet = create_answersheet(self.survey.pk, actor)
+                    results[result_key] = sheet.pk
+                    created.set()
+                    if not release.wait(10):
+                        raise TimeoutError(
+                            "sheet create was not released by test")
+            except BaseException as exc:
+                errors.append(exc)
+                created.set()
+            finally:
+                close_old_connections()
+
+        thread = Thread(target=create_worker)
+        thread.start()
+        if not created.wait(10):
+            release.set()
+            thread.join(10)
+            self.fail("sheet create did not reach its outer transaction")
+        if errors:
+            release.set()
+            thread.join(10)
+            raise errors[0]
+        return thread, release
+
+    def test_different_respondents_create_without_survey_lock(self):
+        first_respondent = User.objects.create_user(
+            username="v10_race_create_first",
+            name="V10 Race Create First",
+        )
+        second_respondent = User.objects.create_user(
+            username="v10_race_create_second",
+            name="V10 Race Create Second",
+        )
+        results = {}
+        errors = []
+        first_thread, release_first = self._start_paused_sheet_create(
+            first_respondent,
+            "first",
+            results,
+            errors,
+        )
+
+        second_done = Event()
+
+        def create_second():
+            close_old_connections()
+            try:
+                results["second"] = create_answersheet(
+                    self.survey.pk,
+                    second_respondent,
+                ).pk
             except BaseException as exc:
                 errors.append(exc)
             finally:
-                if is_second:
-                    second_done.set()
+                second_done.set()
                 close_old_connections()
 
-        first_thread = Thread(target=create_worker, args=(pause_first_after_lock,))
-        second_thread = Thread(
-            target=create_worker,
-            args=(signal_second_lock, True),
-        )
-        first_thread.start()
-        second_started = False
+        second_thread = Thread(target=create_second)
+        second_thread.start()
         try:
-            self.assertTrue(
-                first_has_lock.wait(10),
-                "first create did not lock the survey row",
-            )
-            second_thread.start()
-            second_started = True
-            self.assertTrue(
-                second_attempted_lock.wait(10),
-                "second create did not attempt the survey lock",
-            )
-            self.assertFalse(
-                second_done.wait(0.25),
-                "second create completed while the first held the lock",
-            )
+            completed_without_release = second_done.wait(5)
         finally:
-            allow_first.set()
+            release_first.set()
             first_thread.join(10)
-            if second_started:
-                second_thread.join(10)
+            second_thread.join(10)
 
         self.assertFalse(first_thread.is_alive())
         self.assertFalse(second_thread.is_alive())
         if errors:
             raise errors[0]
-        self.assertEqual(
-            sorted(results),
-            [status.HTTP_201_CREATED, status.HTTP_400_BAD_REQUEST],
+        self.assertTrue(
+            completed_without_release,
+            "an unrelated respondent waited for the first transaction",
         )
+        self.assertEqual(set(results), {"first", "second"})
+        self.assertEqual(
+            AnswerSheet.objects.filter(
+                creator__in=[first_respondent, second_respondent],
+                survey=self.survey,
+            ).count(),
+            2,
+        )
+
+    def test_same_respondent_concurrent_create_is_rejected(self):
+        respondent = User.objects.create_user(
+            username="v10_race_create_same",
+            name="V10 Race Create Same",
+        )
+        results = {}
+        errors = []
+        first_thread, release_first = self._start_paused_sheet_create(
+            respondent,
+            "first",
+            results,
+            errors,
+        )
+        second_done = Event()
+
+        def create_second():
+            close_old_connections()
+            try:
+                create_answersheet(self.survey.pk, respondent)
+                results["second"] = "created"
+            except serializers.ValidationError:
+                results["second"] = "rejected"
+            except BaseException as exc:
+                errors.append(exc)
+            finally:
+                second_done.set()
+                close_old_connections()
+
+        second_thread = Thread(target=create_second)
+        second_thread.start()
+        try:
+            completed_before_commit = second_done.wait(0.25)
+        finally:
+            release_first.set()
+            first_thread.join(10)
+            second_thread.join(10)
+
+        self.assertFalse(first_thread.is_alive())
+        self.assertFalse(second_thread.is_alive())
+        if errors:
+            raise errors[0]
+        self.assertFalse(
+            completed_before_commit,
+            "duplicate create did not wait for the unique-key decision",
+        )
+        self.assertEqual(results["second"], "rejected")
         self.assertEqual(
             AnswerSheet.objects.filter(
                 creator=respondent,

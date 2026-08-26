@@ -18,8 +18,11 @@ __all__ = [
 def create_answersheet(survey_id, actor):
     """Atomically create the actor's only draft sheet for a survey."""
     with transaction.atomic():
+        # The database constraint resolves duplicate-sheet races. Locking the
+        # shared survey row here would serialize unrelated respondents when a
+        # caller creates and submits the whole sheet in one outer transaction.
         try:
-            survey = Survey.objects.select_for_update().get(pk=survey_id)
+            survey = Survey.objects.get(pk=survey_id)
         except Survey.DoesNotExist as exc:
             raise NotFound("问卷不存在或已被删除！") from exc
         if survey.status != Survey.Status.PUBLISHED:
