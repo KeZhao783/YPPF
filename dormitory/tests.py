@@ -2,12 +2,13 @@ from datetime import datetime, timedelta
 from unittest.mock import patch
 
 from django.core.management import call_command
-from django.test import RequestFactory, TestCase
+from django.test import Client, RequestFactory, TestCase
 from django.urls import reverse
 from rest_framework import status
 from rest_framework.test import APIClient
 from rest_framework_simplejwt.tokens import AccessToken
 
+from app.models import NaturalPerson
 from dormitory.management.commands.assign_dormitory import (
     Dormitory as ScoringDormitory,
     Freshman,
